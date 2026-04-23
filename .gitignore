@@ -20,3 +20,11 @@ archive/
 
 
 *.pkl
+
+.tmp.*
+
+log/
+
+conf/
+
+test/

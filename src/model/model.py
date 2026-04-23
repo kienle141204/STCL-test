@@ -1445,6 +1445,182 @@ class EAC_Model(nn.Module):
             self.num_nodes = new_num_nodes
 
 
+# -----------------------------------------------
+# KPrompt: K Learnable Cluster Prompts
+# -----------------------------------------------
+
+def compute_spectral_embed(adj: torch.Tensor, k: int) -> torch.Tensor:
+    """Compute sign-stabilized, L2-normalized eigenvectors of the normalized Laplacian.
+
+    Returns U [N, k_eig] on CPU. Sign is stabilized so the entry with max absolute
+    value in each eigenvector is always positive — reduces inter-year flip instability.
+    """
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+
+    N = adj.shape[0]
+    k_eig = min(k, N - 1)
+    A = (adj + adj.T) / 2
+    D = A.sum(dim=1)
+    D_inv_sqrt = torch.where(D > 0, D.pow(-0.5), torch.zeros_like(D))
+    L_sym = torch.eye(N, device=adj.device) - D_inv_sqrt.unsqueeze(1) * A * D_inv_sqrt.unsqueeze(0)
+
+    try:
+        if N <= 2000:
+            _, eigvecs = torch.linalg.eigh(L_sym)
+            U = eigvecs[:, :k_eig]
+        else:
+            L_np = L_sym.cpu().numpy()
+            _, U_np = spla.eigsh(sp.csr_matrix(L_np), k=k_eig, which='SM')
+            U = torch.from_numpy(U_np.astype(np.float32)).to(adj.device)
+    except Exception:
+        U = torch.randn(N, k_eig, device=adj.device)
+
+    # Sign stabilization: flip each eigenvector so its max-abs entry is positive
+    max_idx = U.abs().argmax(dim=0)                                          # [k_eig]
+    signs = torch.sign(U[max_idx, torch.arange(k_eig, device=adj.device)])  # [k_eig]
+    U = U * signs.unsqueeze(0)
+
+    return F.normalize(U, dim=1).cpu()  # [N, k_eig], L2-normalised rows
+
+
+class KPromptModel(nn.Module):
+    def __init__(self, args):
+        super(KPromptModel, self).__init__()
+        self.args = args
+        self.k = getattr(args, 'k_prompts', 8)
+        self.topk = min(getattr(args, 'prompt_topk', 4), self.k)
+        self.feature_dim = args.gcn["in_channel"]
+        self.hidden_dim = args.gcn["hidden_channel"]
+        self.temporal_dim = getattr(args, 'temporal_dim', 16)
+        self.dropout = args.dropout
+
+        # Prompts live in hidden_dim space (richer than in_channel), projected to backbone I/O
+        self.cluster_prompts = nn.Parameter(
+            torch.empty(self.k, self.hidden_dim).uniform_(-0.01, 0.01)
+        )
+        self.gate_prompts = nn.Parameter(torch.zeros(self.k, self.hidden_dim))
+
+        self.ext_gcn = BatchGCNConv(args.gcn["in_channel"], self.hidden_dim, bias=True, gcn=False)
+        self.ext_proj = nn.Linear(self.hidden_dim, args.gcn["out_channel"], bias=False)
+        nn.init.zeros_(self.ext_proj.weight)  # zero-init: residual branch starts silent
+
+        self.spectral_queries = nn.Parameter(torch.empty(self.k, self.k))
+        nn.init.orthogonal_(self.spectral_queries)
+
+        self.temporal_encoder = nn.Sequential(
+            nn.Linear(self.feature_dim, self.temporal_dim),
+            nn.GELU(),
+            nn.Linear(self.temporal_dim, self.temporal_dim),
+        )
+        self.temporal_queries = nn.Parameter(torch.empty(self.k, self.temporal_dim))
+        nn.init.orthogonal_(self.temporal_queries)
+
+        self.alpha_struct = nn.Parameter(torch.ones(1))
+        self.alpha_temp = nn.Parameter(torch.ones(1))
+        # log_temperature init=0 → tau=1.0: softer assignments pass gradient to all clusters early
+        self.log_temperature = nn.Parameter(torch.zeros(1))
+
+        self._last_W = None  # cached for load-balancing loss
+
+        self.backbone_type = getattr(args, "backbone_type", "stgnn")
+        if self.backbone_type == "dcrnn":
+            self.backbone = DCRNN_Backbone(args)
+        elif self.backbone_type == "astgnn":
+            self.backbone = ASTGNN_Backbone(args)
+        elif self.backbone_type == "tgcn":
+            self.backbone = TGCN_Backbone(args)
+        else:
+            self.backbone = STGNN_Backbone(args)
+
+        self.fc = nn.Linear(args.gcn["out_channel"], args.y_len)
+        self.activation = nn.GELU()
+
+        # persistent=False: recomputed each year, not saved in checkpoint
+        self.register_buffer('spectral_embed',
+                             torch.zeros(args.base_node_size, self.k), persistent=False)
+
+        logger = getattr(args, "logger", None)
+        if logger:
+            logger.info(
+                f"KPromptModel initialized: k={self.k}, topk={self.topk}, "
+                f"prompt_dim={self.hidden_dim} (parallel spatial branch), backbone={self.backbone_type}"
+            )
+
+    def update_clusters(self, adj: torch.Tensor):
+        with torch.no_grad():
+            U = compute_spectral_embed(adj, self.k)
+            N = U.shape[0]
+            if self.spectral_embed.shape[0] < N:
+                extra = torch.zeros(N - self.spectral_embed.shape[0], self.k)
+                self.spectral_embed = torch.cat([self.spectral_embed.cpu(), extra])
+            self.spectral_embed[:N] = U
+            self.spectral_embed = self.spectral_embed.to(adj.device)
+
+        logger = getattr(self.args, "logger", None)
+        if logger:
+            logger.info(f"KPromptModel: spectral embed updated for {N} nodes (k={self.k})")
+
+    def _route(self, x: torch.Tensor, N: int):
+        U = self.spectral_embed[:N]
+        logits_s = U @ F.normalize(self.spectral_queries, dim=1).T
+
+        # Batch-mean averaging damps single-window noise while preserving year-level distribution drift
+        t_embed = F.normalize(self.temporal_encoder(x.mean(dim=0)), dim=1)
+        logits_t = t_embed @ F.normalize(self.temporal_queries, dim=1).T
+
+        tau = self.log_temperature.exp().clamp(min=0.01, max=1.0)
+        logits = (self.alpha_struct * logits_s + self.alpha_temp * logits_t) / tau
+
+        W_full = F.softmax(logits, dim=-1)  # kept for LB loss so gradient reaches all clusters
+        topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
+        topk_w = F.softmax(topk_vals, dim=-1)
+        return topk_w, topk_idx, W_full
+
+    def _prompt(self, topk_w: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
+        w = topk_w.unsqueeze(-1)
+        p = (w * self.cluster_prompts[topk_idx]).sum(dim=1)
+        g = (w * self.gate_prompts[topk_idx]).sum(dim=1)
+        return torch.sigmoid(g) * p
+
+    def _backbone_with_prompt(self, x, adj, p):
+        spatial = F.relu(self.ext_gcn(x, adj))      # [B, N, hidden_dim]
+        prompted = spatial + p.unsqueeze(0)          # [B, N, hidden_dim]
+        bb_out = self.backbone(x, adj)               # [B, N, out_channel]
+        return bb_out + self.ext_proj(prompted)      # [B, N, out_channel]
+
+    def forward(self, data, adj):
+        N = adj.shape[0]
+        x = data.x.reshape(-1, N, self.feature_dim)
+
+        topk_w, topk_idx, W_full = self._route(x, N)
+        self._last_W = W_full
+        p = self._prompt(topk_w, topk_idx)
+
+        feature_map = self._backbone_with_prompt(x, adj, p)
+        feature_map = feature_map.reshape(-1, self.args.gcn["out_channel"])
+
+        # x_out = self.fc(self.activation(feature_map + data.x))
+        # return F.dropout(x_out, p=self.dropout, training=self.training)
+        pre_fc = F.dropout(self.activation(feature_map + data.x), p=self.dropout, training=self.training)
+        return self.fc(pre_fc)
+
+    def feature(self, data, adj):
+        N = adj.shape[0]
+        x = data.x.reshape(-1, N, self.feature_dim)
+        topk_w, topk_idx, _ = self._route(x, N)
+        p = self._prompt(topk_w, topk_idx)
+        feature_map = self._backbone_with_prompt(x, adj, p)
+        return feature_map.reshape(-1, self.args.gcn["out_channel"])
+
+    def get_lb_loss(self) -> torch.Tensor:
+        """KL(mean(W) || uniform) — prevents cluster collapse."""
+        if self._last_W is None:
+            return torch.zeros((), device=self.cluster_prompts.device)
+        importance = self._last_W.mean(dim=0).clamp(min=1e-10)
+        return (importance * importance.log()).sum() + math.log(self.k)
+
+
 class TrafficStream_Model(nn.Module):
     def __init__(self, args):
         super(TrafficStream_Model, self).__init__()
@@ -1639,16 +1815,21 @@ class RAP_Model(nn.Module):
             log_fn(f"strap Parameters: {strap_params}")
 
     def load_state_dict(self, state_dict, strict=True):
-        """Backward-compatible loading for older STRAP checkpoints.
-
-        Older checkpoints may contain a lazily-created projector buffer
-        (`strap.projector.weight`). The simplified STRAP keeps projector as
-        runtime-initialized state, so we safely drop this key when loading.
-        """
-        if isinstance(state_dict, dict) and "strap.projector.weight" in state_dict:
+        if isinstance(state_dict, dict):
             state_dict = dict(state_dict)
             state_dict.pop("strap.projector.weight", None)
-        return super().load_state_dict(state_dict, strict=strict)
+        # Load with strict=False to tolerate the projector buffer being present
+        # in the model but absent from the checkpoint (lazy initialization).
+        result = super().load_state_dict(state_dict, strict=False)
+        if strict:
+            missing = [k for k in result.missing_keys if k != "strap.projector.weight"]
+            if missing or result.unexpected_keys:
+                raise RuntimeError(
+                    f"Error(s) in loading state_dict for {type(self).__name__}:\n"
+                    + (f"\tMissing key(s): {missing}\n" if missing else "")
+                    + (f"\tUnexpected key(s): {result.unexpected_keys}\n" if result.unexpected_keys else "")
+                )
+        return result
     
     def initialize_patterns(self, data, adj, force=False):
         if not self.use_strap:

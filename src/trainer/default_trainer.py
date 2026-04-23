@@ -1,5 +1,6 @@
+import os
 import torch
-
+import random
 import numpy as np
 import os.path as osp
 import networkx as nx
@@ -17,6 +18,11 @@ from utils.common_tools import mkdirs, load_best_model
 
 def train(inputs, args):
     path = osp.join(args.path, str(args.year))  # Define the current year model save path
+    if osp.exists(path):
+        for f in os.listdir(path):
+            if f.endswith(".pkl"):
+                os.remove(osp.join(path, f))
+        args.logger.warning("[*] Cleared existing checkpoints in {}".format(path))
     mkdirs(path)
     
     # Setting the loss function
@@ -26,9 +32,20 @@ def train(inputs, args):
         lossfunc = func.smooth_l1_loss
     
     # Dataset definition
+    # Subsample training data for subsequent years if incremental_train_ratio is set
+    incremental_train_ratio = getattr(args, 'incremental_train_ratio', 1.0)
+    train_x = inputs["train_x"]
+    train_y = inputs["train_y"]
+    if args.year > args.begin_year and incremental_train_ratio < 1.0:
+        n_total = train_x.shape[0]
+        n_sample = max(1, int(n_total * incremental_train_ratio))
+        train_x = train_x[:n_sample]
+        train_y = train_y[:n_sample]
+        args.logger.info(f"[*] Using first {n_sample}/{n_total} samples ({incremental_train_ratio*100:.0f}%)")
+    
     if args.strategy == 'incremental' and args.year > args.begin_year:
         # Incremental Policy Data Loader
-        train_loader = DataLoader(SpatioTemporalDataset("", "", x=inputs["train_x"][:, :, args.subgraph.numpy()], y=inputs["train_y"][:, :, args.subgraph.numpy()], \
+        train_loader = DataLoader(SpatioTemporalDataset("", "", x=train_x[:, :, args.subgraph.numpy()], y=train_y[:, :, args.subgraph.numpy()], \
             edge_index="", mode="subgraph"), batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=32)
         val_loader = DataLoader(SpatioTemporalDataset("", "", x=inputs["val_x"][:, :, args.subgraph.numpy()], y=inputs["val_y"][:, :, args.subgraph.numpy()], \
             edge_index="", mode="subgraph"), batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=32)
@@ -41,7 +58,7 @@ def train(inputs, args):
         vars(args)["sub_adj"] = torch.from_numpy(adj).to(torch.float).to(args.device)
     else:
         # Common Data Loader
-        train_loader = DataLoader(SpatioTemporalDataset(inputs, "train"), batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=32)
+        train_loader = DataLoader(SpatioTemporalDataset("", "", x=train_x, y=train_y, edge_index="", mode="subgraph"), batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=32)
         val_loader = DataLoader(SpatioTemporalDataset(inputs, "val"), batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=32)
         vars(args)["sub_adj"] = vars(args)["adj"]  # Use the adjacency matrix of the entire graph
     
@@ -61,13 +78,20 @@ def train(inputs, args):
         else:
             model = gnn_model  # Otherwise, use the best model loaded
         
-        if args.method == 'EAC':
+        if args.method == 'EAC' or args.method == 'Kprompt':
             for name, param in model.named_parameters():
-                if "gcn1" in name or "tcn1" in name or "gcn2" in name or "fc" in name:
+                if "gcn1" in name or "tcn" in name or "gcn2" in name or "fc" in name or "gcn" in name:
                     param.requires_grad = False
         
         if args.method == 'EAC':
             model.expand_adaptive_params(args.graph_size)
+        
+        if args.method == 'GAPT':
+            n_old = np.load(osp.join(args.graph_path, str(args.year-1)+"_adj.npz"))["x"].shape[0]
+            model.transfer_prompts(n_old, args.graph_size, adj=vars(args).get("adj"))
+
+        if args.method == 'KPrompt':
+            model.update_clusters(args.adj)
         
         if args.method == 'Universal' and args.use_eac == True:
             for name, param in model.named_parameters():
@@ -82,6 +106,12 @@ def train(inputs, args):
         model = gnn_model
         if args.method == 'EAC':
             model.expand_adaptive_params(args.graph_size)
+
+        if args.method == 'GAPT':
+            model.expand_adaptive_params(args.graph_size)
+
+        if args.method == 'KPrompt':
+            model.update_clusters(args.adj)
         
         if args.method == 'Universal' and args.use_eac == True:
             model.expand_adaptive_params(args.graph_size)
@@ -125,9 +155,13 @@ def train(inputs, args):
                 data.y = data.y[:, args.mapping, :]
             
             loss = lossfunc(data.y, pred, reduction="mean")
-            
+
             if args.ewc and args.year > args.begin_year:
                 loss += model.compute_consolidation_loss()  # Calculate and add ewc loss if necessary
+
+            if args.method == 'KPrompt':
+                lb_lambda = getattr(args, 'lb_lambda', 0.01)
+                loss = loss + lb_lambda * model.get_lb_loss()
             
             training_loss += float(loss)
             cn += 1
@@ -187,6 +221,10 @@ def train(inputs, args):
     
     best_model.load_state_dict(torch.load(best_model_path, args.device)["model_state_dict"])
     best_model = best_model.to(args.device)
+    
+    # Save GAPT prompts after training this year
+    if args.method == 'GAPT' and hasattr(best_model, 'save_prompts'):
+        best_model.save_prompts(year=args.year, n_nodes=args.graph_size)
     
     # Test the Model
     test_model(best_model, args, test_loader, True)

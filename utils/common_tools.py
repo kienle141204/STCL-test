@@ -1,6 +1,7 @@
-import os, re, json, torch
+import os, re, json, csv, torch
 import os.path as osp
 import numpy as np
+from datetime import datetime
 from Bio.Cluster import kcluster
 
 
@@ -46,7 +47,12 @@ def load_best_model(args):
             for idx, _ in enumerate(range(args.year - args.begin_year)):
                 model.expand_adaptive_params(args.graph_size_list[idx])
     
-    model.load_state_dict(state_dict)  # Load the state dictionary into the model
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"load_state_dict: missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
     model = model.to(args.device)  # Move the model to the specified device
     return model, loss[0]  # Returns the model and the minimum loss value
 
@@ -63,3 +69,45 @@ def get_max_columns(matrix):
     tensor = torch.tensor(matrix)
     max_columns, _ = torch.max(tensor, dim=1)
     return max_columns
+
+
+def save_results_csv(args, total_time, csv_path="results.csv"):
+    years = list(range(args.begin_year, args.end_year + 1))
+
+    def mean_metric(horizon_key, metric_key):
+        bucket = args.result.get(horizon_key, {}).get(metric_key, {})
+        vals = [bucket[y] for y in years if y in bucket]
+        return round(float(np.mean(vals)), 4) if vals else float("nan")
+
+    dataset = osp.basename(args.model_path.rstrip("/\\"))
+
+    row = {
+        "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "logname":      args.logname,
+        "method":       args.method,
+        "backbone":     getattr(args, "backbone_type", "stgnn"),
+        "dataset":      dataset,
+        "seed":         args.seed,
+        "begin_year":   args.begin_year,
+        "end_year":     args.end_year,
+        "strategy":     getattr(args, "strategy", ""),
+        "lr":           args.lr,
+        "batch_size":   args.batch_size,
+        "epoch":        args.epoch,
+        "hidden_ch":    args.gcn["hidden_channel"],
+        "dropout":      args.dropout,
+        "total_time_s": round(total_time, 2),
+        # avg over all 12 horizons, then averaged over all years
+        "avg_MAE":      mean_metric("Avg", " MAE"),
+        "avg_RMSE":     mean_metric("Avg", "RMSE"),
+        "avg_MAPE":     mean_metric("Avg", "MAPE"),
+    }
+
+    write_header = not osp.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+    args.logger.info(f"[*] Results appended to {csv_path}")
