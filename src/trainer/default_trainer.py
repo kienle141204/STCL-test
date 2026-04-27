@@ -161,7 +161,8 @@ def train(inputs, args):
 
             if args.method == 'KPrompt':
                 lb_lambda = getattr(args, 'lb_lambda', 0.01)
-                loss = loss + lb_lambda * model.get_lb_loss()
+                div_lambda = getattr(args, 'div_lambda', 0.005)
+                loss = loss + lb_lambda * model.get_lb_loss() + div_lambda * model.get_diversity_loss()
             
             training_loss += float(loss)
             cn += 1

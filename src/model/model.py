@@ -1620,6 +1620,12 @@ class KPromptModel(nn.Module):
         importance = self._last_W.mean(dim=0).clamp(min=1e-10)
         return (importance * importance.log()).sum() + math.log(self.k)
 
+    def get_diversity_loss(self) -> torch.Tensor:
+        P = F.normalize(self.cluster_prompts, dim=1)  # [K, hidden_dim]
+        sim = P @ P.T                                 # [K, K]
+        mask = ~torch.eye(self.k, dtype=torch.bool, device=sim.device)
+        return sim[mask].pow(2).mean()
+
 
 class TrafficStream_Model(nn.Module):
     def __init__(self, args):
