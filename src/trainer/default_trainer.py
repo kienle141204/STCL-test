@@ -78,14 +78,17 @@ def train(inputs, args):
         else:
             model = gnn_model  # Otherwise, use the best model loaded
         
-        if args.method == 'EAC' or args.method == 'KPrompt':
+        if args.method == 'EAC' or args.method == 'Kprompt':
             for name, param in model.named_parameters():
                 if "gcn1" in name or "tcn" in name or "gcn2" in name or "fc" in name or "gcn" in name:
                     param.requires_grad = False
         
         if args.method == 'EAC':
             model.expand_adaptive_params(args.graph_size)
-
+        
+        if args.method == 'KPrompt':
+            model.update_clusters(args.adj)
+        
         if args.method == 'Universal' and args.use_eac == True:
             for name, param in model.named_parameters():
                 if "gcn1" in name or "tcn1" in name or "gcn2" in name or "fc" in name:
@@ -100,9 +103,9 @@ def train(inputs, args):
         if args.method == 'EAC':
             model.expand_adaptive_params(args.graph_size)
 
-        if args.method == 'GAPT':
-            model.expand_adaptive_params(args.graph_size)
-
+        if args.method == 'KPrompt':
+            model.update_clusters(args.adj)
+        
         if args.method == 'Universal' and args.use_eac == True:
             model.expand_adaptive_params(args.graph_size)
     
@@ -146,12 +149,13 @@ def train(inputs, args):
             
             loss = lossfunc(data.y, pred, reduction="mean")
 
-            if args.method == 'KPrompt' and getattr(model, 'aux_loss', None) is not None:
-                loss = loss + model.aux_loss
-
             if args.ewc and args.year > args.begin_year:
                 loss += model.compute_consolidation_loss()  # Calculate and add ewc loss if necessary
 
+            if args.method == 'KPrompt':
+                lb_lambda = getattr(args, 'lb_lambda', 0.01)
+                loss = loss + lb_lambda * model.get_lb_loss()
+            
             training_loss += float(loss)
             cn += 1
             
@@ -211,9 +215,6 @@ def train(inputs, args):
     best_model.load_state_dict(torch.load(best_model_path, args.device)["model_state_dict"])
     best_model = best_model.to(args.device)
     
-    # Save GAPT prompts after training this year
-    if args.method == 'GAPT' and hasattr(best_model, 'save_prompts'):
-        best_model.save_prompts(year=args.year, n_nodes=args.graph_size)
     
     # Test the Model
     test_model(best_model, args, test_loader, True)

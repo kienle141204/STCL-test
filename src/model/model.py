@@ -1446,121 +1446,179 @@ class EAC_Model(nn.Module):
 
 
 # -----------------------------------------------
-# KPrompt: K Learnable Prompts (minimal version)
+# KPrompt: K Learnable Cluster Prompts
 # -----------------------------------------------
 
-class KPromptModel(nn.Module):
-    """K learnable prompts, mixed per node by a router that sees temporal + spatial signals.
+def compute_spectral_embed(adj: torch.Tensor, k: int) -> torch.Tensor:
+    """Compute sign-stabilized, L2-normalized eigenvectors of the normalized Laplacian.
 
-    Continual learning: backbone is frozen from year > begin_year (see trainer); only
-    `prompts` and `router` keep adapting. All parameters are size-independent, so the
-    same module loads across years even when the node count changes.
+    Returns U [N, k_eig] on CPU. Sign is stabilized so the entry with max absolute
+    value in each eigenvector is always positive — reduces inter-year flip instability.
     """
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
 
+    N = adj.shape[0]
+    k_eig = min(k, N - 1)
+    A = (adj + adj.T) / 2
+    D = A.sum(dim=1)
+    D_inv_sqrt = torch.where(D > 0, D.pow(-0.5), torch.zeros_like(D))
+    L_sym = torch.eye(N, device=adj.device) - D_inv_sqrt.unsqueeze(1) * A * D_inv_sqrt.unsqueeze(0)
+
+    try:
+        if N <= 2000:
+            _, eigvecs = torch.linalg.eigh(L_sym)
+            U = eigvecs[:, :k_eig]
+        else:
+            L_np = L_sym.cpu().numpy()
+            _, U_np = spla.eigsh(sp.csr_matrix(L_np), k=k_eig, which='SM')
+            U = torch.from_numpy(U_np.astype(np.float32)).to(adj.device)
+    except Exception:
+        U = torch.randn(N, k_eig, device=adj.device)
+
+    # Sign stabilization: flip each eigenvector so its max-abs entry is positive
+    max_idx = U.abs().argmax(dim=0)                                          # [k_eig]
+    signs = torch.sign(U[max_idx, torch.arange(k_eig, device=adj.device)])  # [k_eig]
+    U = U * signs.unsqueeze(0)
+
+    return F.normalize(U, dim=1).cpu()  # [N, k_eig], L2-normalised rows
+
+
+class KPromptModel(nn.Module):
     def __init__(self, args):
         super(KPromptModel, self).__init__()
         self.args = args
         self.k = getattr(args, 'k_prompts', 8)
-        self.feature_dim = args.gcn["in_channel"]     # used only for input reshape
-        self.out_channel = args.gcn["out_channel"]    # backbone output dimension
-        self.prompt_dim  = args.gcn["hidden_channel"] # prompt lives in hidden space
+        self.topk = min(getattr(args, 'prompt_topk', 4), self.k)
+        self.feature_dim = args.gcn["in_channel"]
+        self.hidden_dim = args.gcn["hidden_channel"]
+        self.temporal_dim = getattr(args, 'temporal_dim', 16)
         self.dropout = args.dropout
 
-        # Hyper-params for auxiliary losses
-        self.topk      = min(getattr(args, 'prompt_topk', self.k), self.k)
-        self.lb_lambda  = getattr(args, 'lb_lambda',  0.0)
-        self.div_lambda = getattr(args, 'div_lambda', 0.0)
-        self.aux_loss   = None
+        # Prompts live in hidden_dim space (richer than in_channel), projected to backbone I/O
+        self.cluster_prompts = nn.Parameter(
+            torch.empty(self.k, self.hidden_dim).uniform_(-0.01, 0.01)
+        )
+        self.gate_prompts = nn.Parameter(torch.zeros(self.k, self.hidden_dim))
 
-        # K prompts in hidden space — more expressive than out_channel
-        self.prompts = nn.Parameter(torch.zeros(self.k, self.prompt_dim))
-        nn.init.normal_(self.prompts, std=0.01)
+        self.ext_gcn = BatchGCNConv(args.gcn["in_channel"], self.hidden_dim, bias=True, gcn=False)
+        self.ext_proj = nn.Linear(self.hidden_dim, args.gcn["out_channel"], bias=False)
+        nn.init.zeros_(self.ext_proj.weight)  # zero-init: residual branch starts silent
 
-        # Adapter: expand feature_map to hidden space, add prompt, project back
-        self.up_proj   = nn.Linear(self.out_channel, self.prompt_dim)
-        self.down_proj = nn.Linear(self.prompt_dim,  self.out_channel)
-        # Zero-init down_proj so correction ≈ 0 at the start (stable warm-start)
-        nn.init.zeros_(self.down_proj.weight)
-        nn.init.zeros_(self.down_proj.bias)
+        self.spectral_queries = nn.Parameter(torch.empty(self.k, self.k))
+        nn.init.orthogonal_(self.spectral_queries)
 
-        # Router sees hidden-space features — richer signal for prompt selection
-        self.router = nn.Linear(2 * self.prompt_dim, self.k)
+        self.temporal_encoder = nn.Sequential(
+            nn.Linear(self.feature_dim, self.temporal_dim),
+            nn.GELU(),
+            nn.Linear(self.temporal_dim, self.temporal_dim),
+        )
+        self.temporal_queries = nn.Parameter(torch.empty(self.k, self.temporal_dim))
+        nn.init.orthogonal_(self.temporal_queries)
 
-        backbone_type = getattr(args, "backbone_type", "stgnn")
-        if backbone_type == "dcrnn":
+        self.alpha_struct = nn.Parameter(torch.ones(1))
+        self.alpha_temp = nn.Parameter(torch.ones(1))
+        # log_temperature init=0 → tau=1.0: softer assignments pass gradient to all clusters early
+        self.log_temperature = nn.Parameter(torch.zeros(1))
+
+        self._last_W = None  # cached for load-balancing loss
+
+        self.backbone_type = getattr(args, "backbone_type", "stgnn")
+        if self.backbone_type == "dcrnn":
             self.backbone = DCRNN_Backbone(args)
-        elif backbone_type == "astgnn":
+        elif self.backbone_type == "astgnn":
             self.backbone = ASTGNN_Backbone(args)
-        elif backbone_type == "tgcn":
+        elif self.backbone_type == "tgcn":
             self.backbone = TGCN_Backbone(args)
         else:
             self.backbone = STGNN_Backbone(args)
 
-        self.fc = nn.Linear(self.out_channel, args.y_len)
+        self.fc = nn.Linear(args.gcn["out_channel"], args.y_len)
         self.activation = nn.GELU()
 
-    def _add_prompt(self, feature_map: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        """Adapter-style prompt injection in hidden space.
+        # persistent=False: recomputed each year, not saved in checkpoint
+        self.register_buffer('spectral_embed',
+                             torch.zeros(args.base_node_size, self.k), persistent=False)
 
-        feature_map : [B, N, out_channel]
-        adj         : [N, N]
-        Returns     : [B, N, out_channel]  (feature_map + adapter correction)
-        """
-        # 1. Expand to hidden space where prompts live
-        h = F.gelu(self.up_proj(feature_map))                     # [B, N, prompt_dim]
+        logger = getattr(args, "logger", None)
+        if logger:
+            logger.info(
+                f"KPromptModel initialized: k={self.k}, topk={self.topk}, "
+                f"prompt_dim={self.hidden_dim} (parallel spatial branch), backbone={self.backbone_type}"
+            )
 
-        # 2. Route in hidden space — richer signal than raw out_channel
-        spatial = torch.einsum('nm,bmf->bnf', adj, h)             # [B, N, prompt_dim]
-        feat    = torch.cat([h, spatial], dim=-1)                  # [B, N, 2*prompt_dim]
-        logits  = self.router(feat)                                # [B, N, K]
+    def update_clusters(self, adj: torch.Tensor):
+        with torch.no_grad():
+            U = compute_spectral_embed(adj, self.k)
+            N = U.shape[0]
+            if self.spectral_embed.shape[0] < N:
+                extra = torch.zeros(N - self.spectral_embed.shape[0], self.k)
+                self.spectral_embed = torch.cat([self.spectral_embed.cpu(), extra])
+            self.spectral_embed[:N] = U
+            self.spectral_embed = self.spectral_embed.to(adj.device)
 
-        if self.topk < self.k:
-            topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
-            sparse = torch.full_like(logits, float('-inf'))
-            sparse.scatter_(-1, topk_idx, topk_vals)
-            weights = F.softmax(sparse, dim=-1)
-        else:
-            weights = F.softmax(logits, dim=-1)                    # [B, N, K]
+        logger = getattr(self.args, "logger", None)
+        if logger:
+            logger.info(f"KPromptModel: spectral embed updated for {N} nodes (k={self.k})")
 
-        # 3. Retrieve prompt in hidden space and add to h
-        prompt   = weights @ self.prompts                          # [B, N, prompt_dim]
-        h_adapted = h + prompt                                     # [B, N, prompt_dim]
+    def _route(self, x: torch.Tensor, N: int):
+        U = self.spectral_embed[:N]
+        logits_s = U @ F.normalize(self.spectral_queries, dim=1).T
 
-        # 4. Project back and apply as residual correction
-        correction = self.down_proj(h_adapted)                     # [B, N, out_channel]
+        # Batch-mean averaging damps single-window noise while preserving year-level distribution drift
+        t_embed = F.normalize(self.temporal_encoder(x.mean(dim=0)), dim=1)
+        logits_t = t_embed @ F.normalize(self.temporal_queries, dim=1).T
 
-        # Auxiliary losses (training only)
-        if self.training:
-            avg_usage = weights.mean(dim=(0, 1))                   # [K]
-            lb_loss = self.lb_lambda * (avg_usage * torch.log(avg_usage + 1e-8)).sum()
+        tau = self.log_temperature.exp().clamp(min=0.01, max=1.0)
+        logits = (self.alpha_struct * logits_s + self.alpha_temp * logits_t) / tau
 
-            P = F.normalize(self.prompts, dim=-1)
-            sim = P @ P.T
-            eye = torch.eye(self.k, device=sim.device, dtype=torch.bool)
-            n_pairs = max(self.k * (self.k - 1), 1)
-            div_loss = self.div_lambda * sim.masked_fill(eye, 0).pow(2).sum() / n_pairs
+        W_full = F.softmax(logits, dim=-1)  # kept for LB loss so gradient reaches all clusters
+        topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
+        topk_w = F.softmax(topk_vals, dim=-1)
+        return topk_w, topk_idx, W_full
 
-            self.aux_loss = lb_loss + div_loss
-        else:
-            self.aux_loss = None
+    def _prompt(self, topk_w: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
+        w = topk_w.unsqueeze(-1)
+        p = (w * self.cluster_prompts[topk_idx]).sum(dim=1)
+        g = (w * self.gate_prompts[topk_idx]).sum(dim=1)
+        return torch.sigmoid(g) * p
 
-        return feature_map + correction
+    def _backbone_with_prompt(self, x, adj, p):
+        spatial = F.relu(self.ext_gcn(x, adj))      # [B, N, hidden_dim]
+        prompted = spatial + p.unsqueeze(0)          # [B, N, hidden_dim]
+        bb_out = self.backbone(x, adj)               # [B, N, out_channel]
+        return bb_out + self.ext_proj(prompted)      # [B, N, out_channel]
 
     def forward(self, data, adj):
         N = adj.shape[0]
-        x = data.x.reshape(-1, N, self.feature_dim)               # [B, N, in_channel]
-        feature_map = self.backbone(x, adj)                       # [B, N, out_channel]
-        feature_map = self._add_prompt(feature_map, adj)          # adapter correction
-        feature_map = feature_map.reshape(-1, self.out_channel)   # [B*N, out_channel]
-        out = self.fc(self.activation(feature_map + data.x))
-        return F.dropout(out, p=self.dropout, training=self.training)
+        x = data.x.reshape(-1, N, self.feature_dim)
+
+        topk_w, topk_idx, W_full = self._route(x, N)
+        self._last_W = W_full
+        p = self._prompt(topk_w, topk_idx)
+
+        feature_map = self._backbone_with_prompt(x, adj, p)
+        feature_map = feature_map.reshape(-1, self.args.gcn["out_channel"])
+
+        # x_out = self.fc(self.activation(feature_map + data.x))
+        # return F.dropout(x_out, p=self.dropout, training=self.training)
+        pre_fc = F.dropout(self.activation(feature_map + data.x), p=self.dropout, training=self.training)
+        return self.fc(pre_fc)
 
     def feature(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
-        feature_map = self.backbone(x, adj)
-        feature_map = self._add_prompt(feature_map, adj)
-        return feature_map.reshape(-1, self.out_channel) + data.x
+        topk_w, topk_idx, _ = self._route(x, N)
+        p = self._prompt(topk_w, topk_idx)
+        feature_map = self._backbone_with_prompt(x, adj, p)
+        return feature_map.reshape(-1, self.args.gcn["out_channel"])
+
+    def get_lb_loss(self) -> torch.Tensor:
+        """KL(mean(W) || uniform) — prevents cluster collapse."""
+        if self._last_W is None:
+            return torch.zeros((), device=self.cluster_prompts.device)
+        importance = self._last_W.mean(dim=0).clamp(min=1e-10)
+        return (importance * importance.log()).sum() + math.log(self.k)
 
 
 class TrafficStream_Model(nn.Module):
