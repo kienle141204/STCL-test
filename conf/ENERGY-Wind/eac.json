@@ -42,5 +42,6 @@
 
     "ewc": false,
     
-    "replay": false
+    "replay": false,
+    "incremental_train_ratio": 1
 }

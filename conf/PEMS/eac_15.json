@@ -7,7 +7,7 @@
     "epoch": 100,
     "gpuid": 1,
     "loss": "mse",
-    "activation": "gelu",
+    "activation": "relu",
     "scheduler": "epo",
     "y_len": 12,
     "x_len": 12,
@@ -29,9 +29,9 @@
         "dilation": 1
     },
     
-    "method": "RAP",
+    "method": "EAC",
    
-   
+    "rank": 6,
     "init": true,
     "train": 1,
     "auto_test": 0,
@@ -43,5 +43,5 @@
     "ewc": false,
     
     "replay": false,
-    "incremental_train_ratio": 1
+    "incremental_train_ratio": 0.25
 }

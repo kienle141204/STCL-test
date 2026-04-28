@@ -9,7 +9,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import k_hop_subgraph
 
 from utils.data_convert import generate_samples
-from src.model.model import TrafficStream_Model, STKEC_Model, EAC_Model,RAP_Model,STLora_Model,TGCN_Model,DCRNN_Model,ASTGNN_Model,STGNN_Model,STAdapter_Model,GraphPro_Model,PECPM_Model,GAPT_Model,KPromptModel
+from src.model.model import TrafficStream_Model, STKEC_Model, EAC_Model,RAP_Model,STLora_Model,TGCN_Model,DCRNN_Model,ASTGNN_Model,STGNN_Model,STAdapter_Model,GraphPro_Model,PECPM_Model,KPromptModel
 from dataer.SpatioTemporalDataset import SpatioTemporalDataset
 from model import detect_default
 from src.model import replay
@@ -172,7 +172,10 @@ def main(args):
             total_time += args.result[year]["total_time"]
             args.logger.info(info)
     args.logger.info("total time: {:.4f}".format(total_time))
-    save_results_csv(args, total_time)
+    if args.method == "KPrompt":
+        save_results_csv(args, total_time, csv_path="results_kprompt.csv")
+    else:
+        save_results_csv(args, total_time, csv_path="results.csv")
 
 
 if __name__ == "__main__":
@@ -188,7 +191,7 @@ if __name__ == "__main__":
     parser.add_argument("--first_year_model_path", type = str, default = "", help='specify a pretrained model root')
     args = parser.parse_args()
     vars(args)["device"] = torch.device("cuda:{}".format(args.gpuid)) if torch.cuda.is_available() and args.gpuid != -1 else "cpu"
-    vars(args)["methods"] = {'PECPM':PECPM_Model,'ST-Adapter':STAdapter_Model,'GraphPro':GraphPro_Model,'STGNN_Model':STGNN_Model,'ASTGNN_Model':ASTGNN_Model,'DCRNN_Model':DCRNN_Model,'TGCN_Model':TGCN_Model,'STLoRA':STLora_Model,'RAP':RAP_Model,'TrafficStream': TrafficStream_Model, 'STKEC': STKEC_Model, 'EAC': EAC_Model, 'GAPT': GAPT_Model, 'KPrompt': KPromptModel}
+    vars(args)["methods"] = {'PECPM':PECPM_Model,'ST-Adapter':STAdapter_Model,'GraphPro':GraphPro_Model,'STGNN_Model':STGNN_Model,'ASTGNN_Model':ASTGNN_Model,'DCRNN_Model':DCRNN_Model,'TGCN_Model':TGCN_Model,'STLoRA':STLora_Model,'RAP':RAP_Model,'TrafficStream': TrafficStream_Model, 'STKEC': STKEC_Model, 'EAC': EAC_Model, 'KPrompt': KPromptModel}
     
     init(args)
     seed_anything(args.seed)

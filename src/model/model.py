@@ -1503,7 +1503,11 @@ class KPromptModel(nn.Module):
 
         self.ext_gcn = BatchGCNConv(args.gcn["in_channel"], self.hidden_dim, bias=True, gcn=False)
         self.ext_proj = nn.Linear(self.hidden_dim, args.gcn["out_channel"], bias=False)
-        nn.init.zeros_(self.ext_proj.weight)  # zero-init: residual branch starts silent
+        # Small-scale init (not zero): a zero weight matrix would block gradient flow back
+        # to cluster_prompts, leaving them stuck near init for early training.
+        nn.init.normal_(self.ext_proj.weight, mean=0.0, std=1e-3)
+        # LayerScale gate keeps the residual branch quiet at the start without killing gradients.
+        self.ext_scale = nn.Parameter(torch.zeros(1))
 
         self.spectral_queries = nn.Parameter(torch.empty(self.k, self.k))
         nn.init.orthogonal_(self.spectral_queries)
@@ -1521,7 +1525,10 @@ class KPromptModel(nn.Module):
         # log_temperature init=0 → tau=1.0: softer assignments pass gradient to all clusters early
         self.log_temperature = nn.Parameter(torch.zeros(1))
 
-        self._last_W = None  # cached for load-balancing loss
+        # Cached each forward pass for the auxiliary router losses.
+        self._last_W = None          # softmax over experts            [N, K]
+        self._last_logits = None     # pre-softmax logits (for z-loss) [N, K]
+        self._last_topk_idx = None   # top-k expert indices            [N, topk]
 
         self.backbone_type = getattr(args, "backbone_type", "stgnn")
         if self.backbone_type == "dcrnn":
@@ -1575,7 +1582,7 @@ class KPromptModel(nn.Module):
         W_full = F.softmax(logits, dim=-1)  # kept for LB loss so gradient reaches all clusters
         topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
         topk_w = F.softmax(topk_vals, dim=-1)
-        return topk_w, topk_idx, W_full
+        return topk_w, topk_idx, W_full, logits
 
     def _prompt(self, topk_w: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
         w = topk_w.unsqueeze(-1)
@@ -1584,17 +1591,19 @@ class KPromptModel(nn.Module):
         return torch.sigmoid(g) * p
 
     def _backbone_with_prompt(self, x, adj, p):
-        spatial = F.relu(self.ext_gcn(x, adj))      # [B, N, hidden_dim]
-        prompted = spatial + p.unsqueeze(0)          # [B, N, hidden_dim]
-        bb_out = self.backbone(x, adj)               # [B, N, out_channel]
-        return bb_out + self.ext_proj(prompted)      # [B, N, out_channel]
+        spatial = F.relu(self.ext_gcn(x, adj))                  # [B, N, hidden_dim]
+        prompted = spatial + p.unsqueeze(0)                      # [B, N, hidden_dim]
+        bb_out = self.backbone(x, adj)                           # [B, N, out_channel]
+        return bb_out + self.ext_scale * self.ext_proj(prompted) # [B, N, out_channel]
 
     def forward(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
 
-        topk_w, topk_idx, W_full = self._route(x, N)
+        topk_w, topk_idx, W_full, logits = self._route(x, N)
         self._last_W = W_full
+        self._last_logits = logits
+        self._last_topk_idx = topk_idx
         p = self._prompt(topk_w, topk_idx)
 
         feature_map = self._backbone_with_prompt(x, adj, p)
@@ -1608,17 +1617,31 @@ class KPromptModel(nn.Module):
     def feature(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
-        topk_w, topk_idx, _ = self._route(x, N)
+        topk_w, topk_idx, _, _ = self._route(x, N)
         p = self._prompt(topk_w, topk_idx)
         feature_map = self._backbone_with_prompt(x, adj, p)
         return feature_map.reshape(-1, self.args.gcn["out_channel"])
 
     def get_lb_loss(self) -> torch.Tensor:
-        """KL(mean(W) || uniform) — prevents cluster collapse."""
-        if self._last_W is None:
+        """Switch Transformer load-balancing loss: K * sum(f_i * P_i).
+
+        f_i = fraction of top-k slots assigned to expert i (constant w.r.t. params).
+        P_i = mean softmax probability for expert i (carries the gradient).
+        Minimum is 1.0 when both distributions are uniform; grows when routing
+        concentrates on a few experts.
+        """
+        if self._last_W is None or self._last_topk_idx is None:
             return torch.zeros((), device=self.cluster_prompts.device)
-        importance = self._last_W.mean(dim=0).clamp(min=1e-10)
-        return (importance * importance.log()).sum() + math.log(self.k)
+        P = self._last_W.mean(dim=0)                                       # [K]
+        onehot = F.one_hot(self._last_topk_idx, num_classes=self.k).float()  # [N, topk, K]
+        f = (onehot.sum(dim=1).mean(dim=0) / self.topk).detach()           # [K], sums to 1
+        return self.k * (f * P).sum()
+
+    def get_z_loss(self) -> torch.Tensor:
+        """ST-MoE router z-loss: penalises large logsumexp of router logits."""
+        if self._last_logits is None:
+            return torch.zeros((), device=self.cluster_prompts.device)
+        return (torch.logsumexp(self._last_logits, dim=-1) ** 2).mean()
 
     def get_diversity_loss(self) -> torch.Tensor:
         P = F.normalize(self.cluster_prompts, dim=1)  # [K, hidden_dim]

@@ -1,7 +1,7 @@
 {
     "begin_year": 0,
     "end_year": 3,
-    "dropout": 0.1,
+    "dropout": 0.0,
     "lr": 0.03,
     "batch_size": 128,
     "epoch": 100,
@@ -12,6 +12,7 @@
     "y_len": 12,
     "x_len": 12,
     "data_process": 0,
+    
     "raw_data_path": "data/ENERGY-Wind/RawData/",
     "save_data_path": "data/ENERGY-Wind/FastData/",
     "graph_path": "data/ENERGY-Wind/graph/",
@@ -28,19 +29,27 @@
         "kernel_size": 3,
         "dilation": 1
     },
-    
-    "method": "RAP",
-   
+
+    "method": "ACN",
+    "backbone_type": "stgnn",
+    "num_acn_layers": 4,
+
     "init": true,
     "train": 1,
     "auto_test": 0,
-
-    "strategy": "retrain",
-
-    "detect": false,
-
-    "ewc": false,
     
-    "replay": false,
-    "incremental_train_ratio": 1
+
+    "strategy": "incremental",
+    "increase": true,
+    "num_hops": 2,
+    
+    "detect": true,
+    "detect_strategy": "feature",
+
+    "ewc": true,
+    "ewc_strategy": "ewc", 
+    "ewc_lambda": 0.0001,
+    
+    "replay": true,
+    "replay_strategy": "inforeplay"
 }

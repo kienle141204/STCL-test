@@ -81,6 +81,11 @@ def save_results_csv(args, total_time, csv_path="results.csv"):
 
     dataset = osp.basename(args.model_path.rstrip("/\\"))
 
+    if csv_path == "results_kprompt.csv":
+        csv_path = f"results_kprompt_{dataset}_{args.incremental_train_ratio}.csv"
+    elif csv_path == "results.csv":
+        csv_path = f"results_{args.incremental_train_ratio}.csv"
+
     row = {
         "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "logname":      args.logname,
