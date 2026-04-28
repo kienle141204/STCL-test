@@ -28,3 +28,10 @@ log/
 conf/
 
 test/
+
+*.log
+*.pid
+*.csv
+*.xlsx
+*.zip
+*.sh
