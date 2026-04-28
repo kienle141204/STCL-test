@@ -1446,45 +1446,46 @@ class EAC_Model(nn.Module):
 
 
 # -----------------------------------------------
-# KPrompt: K Learnable Prompts (minimal version)
+# KPrompt V1: K learnable prompts added to raw input x
 # -----------------------------------------------
 
 class KPromptModel(nn.Module):
-    """K learnable prompts, mixed per node by a router that sees temporal + spatial signals.
+    """V1 — Minimal K-prompt for continual STGNN.
 
-    Continual learning: backbone is frozen from year > begin_year (see trainer); only
-    `prompts` and `router` keep adapting. All parameters are size-independent, so the
-    same module loads across years even when the node count changes.
+    Idea: keep a bank of K learnable prompt vectors in the *input* space
+    (same dim as x_raw). Each node, at each batch, retrieves a soft mixture
+    of prompts via a linear router, and the mixture is *added to x_raw*
+    before being passed to the backbone. When the graph/year changes,
+    the router can re-route based on the current per-node window without
+    touching the backbone.
+
+    Roadmap (later versions):
+      V2: ST-conditioned routing (Laplacian PE + temporal encoder, cosine attn)
+      V3: Dual prompts (input bank + output bank)
+      V4: Aux losses (LB entropy + diversity on keys), top-k sparse routing
     """
 
     def __init__(self, args):
         super(KPromptModel, self).__init__()
         self.args = args
-        self.k = getattr(args, 'k_prompts', 8)
-        self.feature_dim = args.gcn["in_channel"]     # used only for input reshape
-        self.out_channel = args.gcn["out_channel"]    # backbone output dimension
-        self.prompt_dim  = args.gcn["hidden_channel"] # prompt lives in hidden space
+        self.feature_dim = args.gcn["in_channel"]      # = x_len (e.g. 12)
+        self.out_channel = args.gcn["out_channel"]
         self.dropout = args.dropout
 
-        # Hyper-params for auxiliary losses
-        self.topk      = min(getattr(args, 'prompt_topk', self.k), self.k)
-        self.lb_lambda  = getattr(args, 'lb_lambda',  0.0)
-        self.div_lambda = getattr(args, 'div_lambda', 0.0)
-        self.aux_loss   = None
+        self.k = getattr(args, 'k_prompts', 8)
+        self.topk = min(getattr(args, 'prompt_topk', self.k), self.k)
 
-        # K prompts in hidden space — more expressive than out_channel
-        self.prompts = nn.Parameter(torch.zeros(self.k, self.prompt_dim))
-        nn.init.normal_(self.prompts, std=0.01)
+        # Prompt bank in raw-input space — added directly to x.
+        # Small std so warm-start ≈ unmodified input.
+        self.prompts = nn.Parameter(torch.empty(self.k, self.feature_dim))
+        nn.init.normal_(self.prompts, std=0.02)
 
-        # Adapter: expand feature_map to hidden space, add prompt, project back
-        self.up_proj   = nn.Linear(self.out_channel, self.prompt_dim)
-        self.down_proj = nn.Linear(self.prompt_dim,  self.out_channel)
-        # Zero-init down_proj so correction ≈ 0 at the start (stable warm-start)
-        nn.init.zeros_(self.down_proj.weight)
-        nn.init.zeros_(self.down_proj.bias)
+        # Router: per-node window [T] -> K logits.
+        # Xavier init (default) so routing is non-degenerate at start.
+        self.router = nn.Linear(self.feature_dim, self.k)
 
-        # Router sees hidden-space features — richer signal for prompt selection
-        self.router = nn.Linear(2 * self.prompt_dim, self.k)
+        # No aux loss in V1 — keep it simple, verify learning first.
+        self.aux_loss = None
 
         backbone_type = getattr(args, "backbone_type", "stgnn")
         if backbone_type == "dcrnn":
@@ -1499,68 +1500,37 @@ class KPromptModel(nn.Module):
         self.fc = nn.Linear(self.out_channel, args.y_len)
         self.activation = nn.GELU()
 
-    def _add_prompt(self, feature_map: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        """Adapter-style prompt injection in hidden space.
-
-        feature_map : [B, N, out_channel]
-        adj         : [N, N]
-        Returns     : [B, N, out_channel]  (feature_map + adapter correction)
-        """
-        # 1. Expand to hidden space where prompts live
-        h = F.gelu(self.up_proj(feature_map))                     # [B, N, prompt_dim]
-
-        # 2. Route in hidden space — richer signal than raw out_channel
-        spatial = torch.einsum('nm,bmf->bnf', adj, h)             # [B, N, prompt_dim]
-        feat    = torch.cat([h, spatial], dim=-1)                  # [B, N, 2*prompt_dim]
-        logits  = self.router(feat)                                # [B, N, K]
-
+    def _route(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, N, T] -> weights: [B, N, K] (softmax over K)."""
+        logits = self.router(x)                                    # [B, N, K]
         if self.topk < self.k:
-            topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
-            sparse = torch.full_like(logits, float('-inf'))
-            sparse.scatter_(-1, topk_idx, topk_vals)
-            weights = F.softmax(sparse, dim=-1)
-        else:
-            weights = F.softmax(logits, dim=-1)                    # [B, N, K]
+            topv, topi = logits.topk(self.topk, dim=-1)
+            sparse     = torch.full_like(logits, float('-inf'))
+            sparse.scatter_(-1, topi, topv)
+            return F.softmax(sparse, dim=-1)
+        return F.softmax(logits, dim=-1)
 
-        # 3. Retrieve prompt in hidden space and add to h
-        prompt   = weights @ self.prompts                          # [B, N, prompt_dim]
-        h_adapted = h + prompt                                     # [B, N, prompt_dim]
-
-        # 4. Project back and apply as residual correction
-        correction = self.down_proj(h_adapted)                     # [B, N, out_channel]
-
-        # Auxiliary losses (training only)
-        if self.training:
-            avg_usage = weights.mean(dim=(0, 1))                   # [K]
-            lb_loss = self.lb_lambda * (avg_usage * torch.log(avg_usage + 1e-8)).sum()
-
-            P = F.normalize(self.prompts, dim=-1)
-            sim = P @ P.T
-            eye = torch.eye(self.k, device=sim.device, dtype=torch.bool)
-            n_pairs = max(self.k * (self.k - 1), 1)
-            div_loss = self.div_lambda * sim.masked_fill(eye, 0).pow(2).sum() / n_pairs
-
-            self.aux_loss = lb_loss + div_loss
-        else:
-            self.aux_loss = None
-
-        return feature_map + correction
+    def _prompted_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Add a routed prompt mixture to raw x. Shapes: [B, N, T] -> [B, N, T]."""
+        weights = self._route(x)                                   # [B, N, K]
+        prompt = weights @ self.prompts                           # [B, N, T]
+        return x + prompt
 
     def forward(self, data, adj):
         N = adj.shape[0]
-        x = data.x.reshape(-1, N, self.feature_dim)               # [B, N, in_channel]
-        feature_map = self.backbone(x, adj)                       # [B, N, out_channel]
-        feature_map = self._add_prompt(feature_map, adj)          # adapter correction
-        feature_map = feature_map.reshape(-1, self.out_channel)   # [B*N, out_channel]
-        out = self.fc(self.activation(feature_map + data.x))
+        x = data.x.reshape(-1, N, self.feature_dim)           # [B, N, T]
+        x_aug = self._prompted_input(x)                           # [B, N, T]
+        feat = self.backbone(x_aug, adj)                         # [B, N, out]
+        feat = feat.reshape(-1, self.out_channel)                # [B*N, out]
+        out = self.fc(self.activation(feat + data.x))
         return F.dropout(out, p=self.dropout, training=self.training)
 
     def feature(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
-        feature_map = self.backbone(x, adj)
-        feature_map = self._add_prompt(feature_map, adj)
-        return feature_map.reshape(-1, self.out_channel) + data.x
+        x_aug = self._prompted_input(x)
+        feat = self.backbone(x_aug, adj).reshape(-1, self.out_channel)
+        return feat + data.x
 
 
 class TrafficStream_Model(nn.Module):

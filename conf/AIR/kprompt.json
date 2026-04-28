@@ -28,11 +28,8 @@
         "dilation": 1
     },
     "method": "KPrompt",
-    "k_prompts": 128,
-    "prompt_topk": 16,
-    "temporal_dim": 16,
-    "lb_lambda": 0.01,
-    "div_lambda": 0.01,
+    "k_prompts": 64,
+    "prompt_topk": 8,
     "init": true,
     "train": 1,
     "auto_test": 0,
