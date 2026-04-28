@@ -1446,45 +1446,82 @@ class EAC_Model(nn.Module):
 
 
 # -----------------------------------------------
-# KPrompt V1: K learnable prompts added to raw input x
+# KPrompt V3: Dual ST-conditioned prompt banks
 # -----------------------------------------------
 
 class KPromptModel(nn.Module):
-    """V1 — Minimal K-prompt for continual STGNN.
+    """V3 — Dual prompts (input + output banks) routed by an ST query.
 
-    Idea: keep a bank of K learnable prompt vectors in the *input* space
-    (same dim as x_raw). Each node, at each batch, retrieves a soft mixture
-    of prompts via a linear router, and the mixture is *added to x_raw*
-    before being passed to the backbone. When the graph/year changes,
-    the router can re-route based on the current per-node window without
-    touching the backbone.
+    Idea: two banks of K learnable prompts.
+      - Input bank  (K × feature_dim) is added to x_raw *before* the backbone
+        so prompts can shape what the backbone sees when graph/year shifts.
+      - Output bank (K × out_channel) is added to the backbone output as a
+        residual correction in the prediction-feature space.
 
-    Roadmap (later versions):
-      V2: ST-conditioned routing (Laplacian PE + temporal encoder, cosine attn)
-      V3: Dual prompts (input bank + output bank)
-      V4: Aux losses (LB entropy + diversity on keys), top-k sparse routing
+    Both banks share a single ST query per node:
+        query = [ Laplacian-PE(adj) | TimeEncoder(x_window) ]
+    but each bank has its own keys, so routing can specialise per space.
+
+    Routing = cosine attention (L2-normalised query · L2-normalised keys),
+    scaled by a learnable temperature `tau` (cosine ∈ [-1,1] is too flat for
+    softmax without scaling), then top-k sparse softmax.
+
+    Roadmap: V4 will add aux losses (LB entropy + diversity on keys).
     """
 
     def __init__(self, args):
         super(KPromptModel, self).__init__()
-        self.args = args
+        self.args        = args
         self.feature_dim = args.gcn["in_channel"]      # = x_len (e.g. 12)
         self.out_channel = args.gcn["out_channel"]
-        self.dropout = args.dropout
+        self.dropout     = args.dropout
 
-        self.k = getattr(args, 'k_prompts', 8)
+        self.k    = getattr(args, 'k_prompts', 8)
         self.topk = min(getattr(args, 'prompt_topk', self.k), self.k)
 
-        # Prompt bank in raw-input space — added directly to x.
-        # Small std so warm-start ≈ unmodified input.
-        self.prompts = nn.Parameter(torch.empty(self.k, self.feature_dim))
-        nn.init.normal_(self.prompts, std=0.02)
+        # ST query dims
+        self.temporal_dim = getattr(args, 'temporal_dim', 16)
+        self.spatial_dim  = getattr(args, 'spatial_dim',  self.temporal_dim)
+        self.lap_k        = getattr(args, 'lap_k',        self.spatial_dim)
+        self.query_dim    = self.spatial_dim + self.temporal_dim
 
-        # Router: per-node window [T] -> K logits.
-        # Xavier init (default) so routing is non-degenerate at start.
-        self.router = nn.Linear(self.feature_dim, self.k)
+        # Spatial branch: Laplacian PE -> spatial_dim
+        self.spatio_proj = nn.Sequential(
+            nn.Linear(self.lap_k, self.spatial_dim),
+            nn.LayerNorm(self.spatial_dim),
+        )
+        # Temporal branch: per-node window -> temporal_dim
+        self.time_encoder = nn.Sequential(
+            nn.Linear(self.feature_dim, self.temporal_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.temporal_dim),
+        )
 
-        # No aux loss in V1 — keep it simple, verify learning first.
+        # Two prompt banks, each with own keys.
+        # Input bank: added to x_raw, lives in feature_dim space.
+        self.in_keys    = nn.Parameter(torch.empty(self.k, self.query_dim))
+        self.in_prompts = nn.Parameter(torch.empty(self.k, self.feature_dim))
+        nn.init.normal_(self.in_keys,    std=0.02)
+        nn.init.normal_(self.in_prompts, std=0.02)
+
+        # Output bank: added to backbone output, lives in out_channel space.
+        self.out_keys    = nn.Parameter(torch.empty(self.k, self.query_dim))
+        self.out_prompts = nn.Parameter(torch.empty(self.k, self.out_channel))
+        nn.init.normal_(self.out_keys,    std=0.02)
+        nn.init.normal_(self.out_prompts, std=0.02)
+
+        # Learnable temperature for cosine attention.
+        # cosine ∈ [-1,1]; tau≈10 gives logits in [-10,10] before top-k softmax.
+        self.tau = nn.Parameter(torch.tensor(10.0))
+
+        # Laplacian PE cache, keyed by id(adj). Trainer reuses the same
+        # adj tensor within a year, so id is stable; new year -> new tensor
+        # -> automatic invalidation.
+        self._lap_pe = None
+        self._lap_n  = -1
+        self._adj_id = None
+
+        # No aux loss in V3 (added in V4).
         self.aux_loss = None
 
         backbone_type = getattr(args, "backbone_type", "stgnn")
@@ -1497,39 +1534,112 @@ class KPromptModel(nn.Module):
         else:
             self.backbone = STGNN_Backbone(args)
 
-        self.fc = nn.Linear(self.out_channel, args.y_len)
+        self.fc         = nn.Linear(self.out_channel, args.y_len)
         self.activation = nn.GELU()
 
-    def _route(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, N, T] -> weights: [B, N, K] (softmax over K)."""
-        logits = self.router(x)                                    # [B, N, K]
+    # ------------------------------------------------------------------
+    # Laplacian PE
+    # ------------------------------------------------------------------
+
+    def _compute_lap_pe(self, adj: torch.Tensor) -> torch.Tensor:
+        """Sign-normalised Laplacian PE; cached by id(adj). Returns [N, lap_k]."""
+        N = adj.shape[0]
+        adj_id = id(adj)
+        if (self._lap_pe is not None
+                and self._lap_n == N
+                and self._adj_id == adj_id):
+            return self._lap_pe
+
+        with torch.no_grad():
+            deg        = adj.sum(dim=-1).clamp(min=1e-8)
+            d_inv_sqrt = deg.pow(-0.5)
+            # L = I - D^{-1/2} A D^{-1/2}
+            L = torch.eye(N, device=adj.device, dtype=adj.dtype) - \
+                d_inv_sqrt.unsqueeze(1) * adj * d_inv_sqrt.unsqueeze(0)
+
+            _, eigvecs = torch.linalg.eigh(L)               # ascending
+            k      = min(self.lap_k, N - 1)
+            lap_pe = eigvecs[:, 1:k + 1]                    # skip constant; [N, k]
+
+            # Sign normalisation: flip each column so its max-abs entry is positive.
+            max_idx  = lap_pe.abs().argmax(dim=0)                     # [k]
+            max_sign = lap_pe.gather(0, max_idx.unsqueeze(0)).sign()  # [1, k]
+            lap_pe   = lap_pe * max_sign
+
+            if k < self.lap_k:                              # tiny graphs -> pad
+                pad    = torch.zeros(N, self.lap_k - k, device=adj.device, dtype=adj.dtype)
+                lap_pe = torch.cat([lap_pe, pad], dim=-1)
+
+        self._lap_pe = lap_pe
+        self._lap_n  = N
+        self._adj_id = adj_id
+        return lap_pe
+
+    # ------------------------------------------------------------------
+    # ST query + cosine routing
+    # ------------------------------------------------------------------
+
+    def _build_query(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """x: [B, N, T], adj: [N, N]  ->  query: [B, N, query_dim]"""
+        B, N, _ = x.shape
+        lap_pe = self._compute_lap_pe(adj)                  # [N, lap_k]
+        spatio = self.spatio_proj(lap_pe)                   # [N, spatial_dim]
+        spatio = spatio.unsqueeze(0).expand(B, -1, -1)      # [B, N, spatial_dim]
+        temp   = self.time_encoder(x)                       # [B, N, temporal_dim]
+        return torch.cat([spatio, temp], dim=-1)            # [B, N, query_dim]
+
+    def _route(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """query: [B, N, D], keys: [K, D]  ->  weights: [B, N, K]."""
+        q_norm = F.normalize(query, dim=-1)
+        k_norm = F.normalize(keys,  dim=-1)
+        scores = self.tau * torch.einsum('bnd,kd->bnk', q_norm, k_norm)   # [B, N, K]
         if self.topk < self.k:
-            topv, topi = logits.topk(self.topk, dim=-1)
-            sparse     = torch.full_like(logits, float('-inf'))
+            topv, topi = scores.topk(self.topk, dim=-1)
+            sparse     = torch.full_like(scores, float('-inf'))
             sparse.scatter_(-1, topi, topv)
             return F.softmax(sparse, dim=-1)
-        return F.softmax(logits, dim=-1)
+        return F.softmax(scores, dim=-1)
 
-    def _prompted_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Add a routed prompt mixture to raw x. Shapes: [B, N, T] -> [B, N, T]."""
-        weights = self._route(x)                                   # [B, N, K]
-        prompt = weights @ self.prompts                           # [B, N, T]
-        return x + prompt
+    # ------------------------------------------------------------------
+    # forward / feature
+    # ------------------------------------------------------------------
 
     def forward(self, data, adj):
         N = adj.shape[0]
-        x = data.x.reshape(-1, N, self.feature_dim)           # [B, N, T]
-        x_aug = self._prompted_input(x)                           # [B, N, T]
-        feat = self.backbone(x_aug, adj)                         # [B, N, out]
-        feat = feat.reshape(-1, self.out_channel)                # [B*N, out]
-        out = self.fc(self.activation(feat + data.x))
+        x = data.x.reshape(-1, N, self.feature_dim)         # [B, N, T]
+
+        query = self._build_query(x, adj)                   # [B, N, query_dim]
+
+        # Input prompt: route -> mix -> add to x_raw before backbone
+        w_in  = self._route(query, self.in_keys)            # [B, N, K]
+        p_in  = w_in @ self.in_prompts                      # [B, N, T]
+        x_aug = x + p_in
+
+        feat = self.backbone(x_aug, adj)                    # [B, N, out]
+
+        # Output prompt: route -> mix -> add residual on backbone output
+        w_out = self._route(query, self.out_keys)           # [B, N, K]
+        p_out = w_out @ self.out_prompts                    # [B, N, out]
+        feat  = feat + p_out
+
+        feat = feat.reshape(-1, self.out_channel)           # [B*N, out]
+        out  = self.fc(self.activation(feat + data.x))
         return F.dropout(out, p=self.dropout, training=self.training)
 
     def feature(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
-        x_aug = self._prompted_input(x)
-        feat = self.backbone(x_aug, adj).reshape(-1, self.out_channel)
+
+        query = self._build_query(x, adj)
+
+        w_in  = self._route(query, self.in_keys)
+        p_in  = w_in @ self.in_prompts
+        x_aug = x + p_in
+
+        feat  = self.backbone(x_aug, adj)
+        w_out = self._route(query, self.out_keys)
+        p_out = w_out @ self.out_prompts
+        feat  = (feat + p_out).reshape(-1, self.out_channel)
         return feat + data.x
 
 

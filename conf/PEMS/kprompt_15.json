@@ -30,6 +30,8 @@
     "method": "KPrompt",
     "k_prompts": 64,
     "prompt_topk": 12,
+    "temporal_dim": 16,
+    "lap_k": 16,
     "init": true,
     "train": 1,
     "auto_test": 0,
