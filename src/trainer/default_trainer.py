@@ -146,6 +146,9 @@ def train(inputs, args):
             
             loss = lossfunc(data.y, pred, reduction="mean")
 
+            if args.method == 'KPrompt' and getattr(model, 'aux_loss', None) is not None:
+                loss = loss + model.aux_loss
+
             if args.ewc and args.year > args.begin_year:
                 loss += model.compute_consolidation_loss()  # Calculate and add ewc loss if necessary
 

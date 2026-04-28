@@ -1461,14 +1461,22 @@ class KPromptModel(nn.Module):
         super(KPromptModel, self).__init__()
         self.args = args
         self.k = getattr(args, 'k_prompts', 8)
-        self.feature_dim = args.gcn["in_channel"]
+        self.feature_dim = args.gcn["in_channel"]   # used only for input reshape
+        self.out_channel = args.gcn["out_channel"]  # prompt and router live in this space
         self.dropout = args.dropout
 
-        self.prompts = nn.Parameter(torch.zeros(self.k, self.feature_dim))
+        # Hyper-params for auxiliary losses (Step 1)
+        self.topk = min(getattr(args, 'prompt_topk', self.k), self.k)
+        self.lb_lambda = getattr(args, 'lb_lambda', 0.0)
+        self.div_lambda = getattr(args, 'div_lambda', 0.0)
+        self.aux_loss = None  # set in _add_prompt during training
+
+        # Prompts live in backbone output space (out_channel), not raw input space
+        self.prompts = nn.Parameter(torch.zeros(self.k, self.out_channel))
         nn.init.normal_(self.prompts, std=0.01)
 
-        # Router input: [temporal signature ‖ one-hop spatial aggregation] → K logits
-        self.router = nn.Linear(2 * self.feature_dim, self.k)
+        # Router: takes backbone features [node ‖ one-hop neighbour] → K logits
+        self.router = nn.Linear(2 * self.out_channel, self.k)
 
         backbone_type = getattr(args, "backbone_type", "stgnn")
         if backbone_type == "dcrnn":
@@ -1480,32 +1488,64 @@ class KPromptModel(nn.Module):
         else:
             self.backbone = STGNN_Backbone(args)
 
-        self.fc = nn.Linear(args.gcn["out_channel"], args.y_len)
+        self.fc = nn.Linear(self.out_channel, args.y_len)
         self.activation = nn.GELU()
 
-    def _add_prompt(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, F]; adj: [N, N]
-        temporal = x.mean(dim=0)                                 # [N, F]  per-node time window
-        spatial = adj @ temporal                                 # [N, F]  one-hop neighbour mix
-        feat = torch.cat([temporal, spatial], dim=-1)            # [N, 2F]
-        weights = F.softmax(self.router(feat), dim=-1)           # [N, K]
-        prompt = weights @ self.prompts                          # [N, F]
-        return x + prompt.unsqueeze(0)
+    def _add_prompt(self, feature_map: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """Inject prompt into backbone output space.
+
+        feature_map: [B, N, out_channel] — rich spatio-temporal representation from backbone.
+        adj:         [N, N]
+        Returns:     [B, N, out_channel] with prompt added.
+        """
+        # Route using backbone features, not raw input — richer signal for prompt selection
+        spatial = torch.einsum('nm,bmf->bnf', adj, feature_map)  # [B, N, out_channel]
+        feat = torch.cat([feature_map, spatial], dim=-1)          # [B, N, 2*out_channel]
+        logits = self.router(feat)                                # [B, N, K]
+
+        # Sparse top-k routing (Step 1a)
+        if self.topk < self.k:
+            topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
+            sparse = torch.full_like(logits, float('-inf'))
+            sparse.scatter_(-1, topk_idx, topk_vals)
+            weights = F.softmax(sparse, dim=-1)                   # [B, N, K]
+        else:
+            weights = F.softmax(logits, dim=-1)                   # [B, N, K]
+
+        prompt = weights @ self.prompts                           # [B, N, out_channel]
+
+        # Auxiliary losses, computed only during training (Step 1b & 1c)
+        if self.training:
+            avg_usage = weights.mean(dim=(0, 1))                  # [K]
+            lb_loss = self.lb_lambda * (avg_usage * torch.log(avg_usage + 1e-8)).sum()
+
+            P = F.normalize(self.prompts, dim=-1)                 # [K, out_channel]
+            sim = P @ P.T                                         # [K, K]
+            eye = torch.eye(self.k, device=sim.device, dtype=torch.bool)
+            n_pairs = max(self.k * (self.k - 1), 1)
+            div_loss = self.div_lambda * sim.masked_fill(eye, 0).pow(2).sum() / n_pairs
+
+            self.aux_loss = lb_loss + div_loss
+        else:
+            self.aux_loss = None
+
+        return feature_map + prompt
 
     def forward(self, data, adj):
         N = adj.shape[0]
-        x = data.x.reshape(-1, N, self.feature_dim)
-        x = self._add_prompt(x, adj)
-        feature_map = self.backbone(x, adj).reshape(-1, self.args.gcn["out_channel"])
+        x = data.x.reshape(-1, N, self.feature_dim)              # [B, N, in_channel]
+        feature_map = self.backbone(x, adj)                      # [B, N, out_channel] — clean input
+        feature_map = self._add_prompt(feature_map, adj)         # inject at hidden level
+        feature_map = feature_map.reshape(-1, self.out_channel)  # [B*N, out_channel]
         out = self.fc(self.activation(feature_map + data.x))
         return F.dropout(out, p=self.dropout, training=self.training)
 
     def feature(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
-        x = self._add_prompt(x, adj)
-        feature_map = self.backbone(x, adj).reshape(-1, self.args.gcn["out_channel"])
-        return feature_map + data.x
+        feature_map = self.backbone(x, adj)
+        feature_map = self._add_prompt(feature_map, adj)
+        return feature_map.reshape(-1, self.out_channel) + data.x
 
 
 class TrafficStream_Model(nn.Module):
