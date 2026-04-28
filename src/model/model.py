@@ -1446,96 +1446,36 @@ class EAC_Model(nn.Module):
 
 
 # -----------------------------------------------
-# KPrompt: K Learnable Cluster Prompts
+# KPrompt: K Learnable Prompts (minimal version)
 # -----------------------------------------------
 
-def compute_spectral_embed(adj: torch.Tensor, k: int) -> torch.Tensor:
-    """Compute sign-stabilized, L2-normalized eigenvectors of the normalized Laplacian.
-
-    Returns U [N, k_eig] on CPU. Sign is stabilized so the entry with max absolute
-    value in each eigenvector is always positive — reduces inter-year flip instability.
-    """
-    import scipy.sparse as sp
-    import scipy.sparse.linalg as spla
-
-    N = adj.shape[0]
-    k_eig = min(k, N - 1)
-    A = (adj + adj.T) / 2
-    D = A.sum(dim=1)
-    D_inv_sqrt = torch.where(D > 0, D.pow(-0.5), torch.zeros_like(D))
-    L_sym = torch.eye(N, device=adj.device) - D_inv_sqrt.unsqueeze(1) * A * D_inv_sqrt.unsqueeze(0)
-
-    try:
-        if N <= 2000:
-            _, eigvecs = torch.linalg.eigh(L_sym)
-            U = eigvecs[:, :k_eig]
-        else:
-            L_np = L_sym.cpu().numpy()
-            _, U_np = spla.eigsh(sp.csr_matrix(L_np), k=k_eig, which='SM')
-            U = torch.from_numpy(U_np.astype(np.float32)).to(adj.device)
-    except Exception:
-        U = torch.randn(N, k_eig, device=adj.device)
-
-    # Sign stabilization: flip each eigenvector so its max-abs entry is positive
-    max_idx = U.abs().argmax(dim=0)                                          # [k_eig]
-    signs = torch.sign(U[max_idx, torch.arange(k_eig, device=adj.device)])  # [k_eig]
-    U = U * signs.unsqueeze(0)
-
-    return F.normalize(U, dim=1).cpu()  # [N, k_eig], L2-normalised rows
-
-
 class KPromptModel(nn.Module):
+    """K learnable prompts, mixed per node by a router that sees temporal + spatial signals.
+
+    Continual learning: backbone is frozen from year > begin_year (see trainer); only
+    `prompts` and `router` keep adapting. All parameters are size-independent, so the
+    same module loads across years even when the node count changes.
+    """
+
     def __init__(self, args):
         super(KPromptModel, self).__init__()
         self.args = args
         self.k = getattr(args, 'k_prompts', 8)
-        self.topk = min(getattr(args, 'prompt_topk', 4), self.k)
         self.feature_dim = args.gcn["in_channel"]
-        self.hidden_dim = args.gcn["hidden_channel"]
-        self.temporal_dim = getattr(args, 'temporal_dim', 16)
         self.dropout = args.dropout
 
-        # Prompts live in hidden_dim space (richer than in_channel), projected to backbone I/O
-        self.cluster_prompts = nn.Parameter(
-            torch.empty(self.k, self.hidden_dim).uniform_(-0.01, 0.01)
-        )
-        self.gate_prompts = nn.Parameter(torch.zeros(self.k, self.hidden_dim))
+        self.prompts = nn.Parameter(torch.zeros(self.k, self.feature_dim))
+        nn.init.normal_(self.prompts, std=0.01)
 
-        self.ext_gcn = BatchGCNConv(args.gcn["in_channel"], self.hidden_dim, bias=True, gcn=False)
-        self.ext_proj = nn.Linear(self.hidden_dim, args.gcn["out_channel"], bias=False)
-        # Small-scale init (not zero): a zero weight matrix would block gradient flow back
-        # to cluster_prompts, leaving them stuck near init for early training.
-        nn.init.normal_(self.ext_proj.weight, mean=0.0, std=1e-3)
-        # LayerScale gate keeps the residual branch quiet at the start without killing gradients.
-        self.ext_scale = nn.Parameter(torch.zeros(1))
+        # Router input: [temporal signature ‖ one-hop spatial aggregation] → K logits
+        self.router = nn.Linear(2 * self.feature_dim, self.k)
 
-        self.spectral_queries = nn.Parameter(torch.empty(self.k, self.k))
-        nn.init.orthogonal_(self.spectral_queries)
-
-        self.temporal_encoder = nn.Sequential(
-            nn.Linear(self.feature_dim, self.temporal_dim),
-            nn.GELU(),
-            nn.Linear(self.temporal_dim, self.temporal_dim),
-        )
-        self.temporal_queries = nn.Parameter(torch.empty(self.k, self.temporal_dim))
-        nn.init.orthogonal_(self.temporal_queries)
-
-        self.alpha_struct = nn.Parameter(torch.ones(1))
-        self.alpha_temp = nn.Parameter(torch.ones(1))
-        # log_temperature init=0 → tau=1.0: softer assignments pass gradient to all clusters early
-        self.log_temperature = nn.Parameter(torch.zeros(1))
-
-        # Cached each forward pass for the auxiliary router losses.
-        self._last_W = None          # softmax over experts            [N, K]
-        self._last_logits = None     # pre-softmax logits (for z-loss) [N, K]
-        self._last_topk_idx = None   # top-k expert indices            [N, topk]
-
-        self.backbone_type = getattr(args, "backbone_type", "stgnn")
-        if self.backbone_type == "dcrnn":
+        backbone_type = getattr(args, "backbone_type", "stgnn")
+        if backbone_type == "dcrnn":
             self.backbone = DCRNN_Backbone(args)
-        elif self.backbone_type == "astgnn":
+        elif backbone_type == "astgnn":
             self.backbone = ASTGNN_Backbone(args)
-        elif self.backbone_type == "tgcn":
+        elif backbone_type == "tgcn":
             self.backbone = TGCN_Backbone(args)
         else:
             self.backbone = STGNN_Backbone(args)
@@ -1543,111 +1483,29 @@ class KPromptModel(nn.Module):
         self.fc = nn.Linear(args.gcn["out_channel"], args.y_len)
         self.activation = nn.GELU()
 
-        # persistent=False: recomputed each year, not saved in checkpoint
-        self.register_buffer('spectral_embed',
-                             torch.zeros(args.base_node_size, self.k), persistent=False)
-
-        logger = getattr(args, "logger", None)
-        if logger:
-            logger.info(
-                f"KPromptModel initialized: k={self.k}, topk={self.topk}, "
-                f"prompt_dim={self.hidden_dim} (parallel spatial branch), backbone={self.backbone_type}"
-            )
-
-    def update_clusters(self, adj: torch.Tensor):
-        with torch.no_grad():
-            U = compute_spectral_embed(adj, self.k)
-            N = U.shape[0]
-            if self.spectral_embed.shape[0] < N:
-                extra = torch.zeros(N - self.spectral_embed.shape[0], self.k)
-                self.spectral_embed = torch.cat([self.spectral_embed.cpu(), extra])
-            self.spectral_embed[:N] = U
-            self.spectral_embed = self.spectral_embed.to(adj.device)
-
-        logger = getattr(self.args, "logger", None)
-        if logger:
-            logger.info(f"KPromptModel: spectral embed updated for {N} nodes (k={self.k})")
-
-    def _route(self, x: torch.Tensor, N: int):
-        U = self.spectral_embed[:N]
-        logits_s = U @ F.normalize(self.spectral_queries, dim=1).T
-
-        # Batch-mean averaging damps single-window noise while preserving year-level distribution drift
-        t_embed = F.normalize(self.temporal_encoder(x.mean(dim=0)), dim=1)
-        logits_t = t_embed @ F.normalize(self.temporal_queries, dim=1).T
-
-        tau = self.log_temperature.exp().clamp(min=0.01, max=1.0)
-        logits = (self.alpha_struct * logits_s + self.alpha_temp * logits_t) / tau
-
-        W_full = F.softmax(logits, dim=-1)  # kept for LB loss so gradient reaches all clusters
-        topk_vals, topk_idx = logits.topk(self.topk, dim=-1)
-        topk_w = F.softmax(topk_vals, dim=-1)
-        return topk_w, topk_idx, W_full, logits
-
-    def _prompt(self, topk_w: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
-        w = topk_w.unsqueeze(-1)
-        p = (w * self.cluster_prompts[topk_idx]).sum(dim=1)
-        g = (w * self.gate_prompts[topk_idx]).sum(dim=1)
-        return torch.sigmoid(g) * p
-
-    def _backbone_with_prompt(self, x, adj, p):
-        spatial = F.relu(self.ext_gcn(x, adj))                  # [B, N, hidden_dim]
-        prompted = spatial + p.unsqueeze(0)                      # [B, N, hidden_dim]
-        bb_out = self.backbone(x, adj)                           # [B, N, out_channel]
-        return bb_out + self.ext_scale * self.ext_proj(prompted) # [B, N, out_channel]
+    def _add_prompt(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        # x: [B, N, F]; adj: [N, N]
+        temporal = x.mean(dim=0)                                 # [N, F]  per-node time window
+        spatial = adj @ temporal                                 # [N, F]  one-hop neighbour mix
+        feat = torch.cat([temporal, spatial], dim=-1)            # [N, 2F]
+        weights = F.softmax(self.router(feat), dim=-1)           # [N, K]
+        prompt = weights @ self.prompts                          # [N, F]
+        return x + prompt.unsqueeze(0)
 
     def forward(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
-
-        topk_w, topk_idx, W_full, logits = self._route(x, N)
-        self._last_W = W_full
-        self._last_logits = logits
-        self._last_topk_idx = topk_idx
-        p = self._prompt(topk_w, topk_idx)
-
-        feature_map = self._backbone_with_prompt(x, adj, p)
-        feature_map = feature_map.reshape(-1, self.args.gcn["out_channel"])
-
-        # x_out = self.fc(self.activation(feature_map + data.x))
-        # return F.dropout(x_out, p=self.dropout, training=self.training)
-        pre_fc = F.dropout(self.activation(feature_map + data.x), p=self.dropout, training=self.training)
-        return self.fc(pre_fc)
+        x = self._add_prompt(x, adj)
+        feature_map = self.backbone(x, adj).reshape(-1, self.args.gcn["out_channel"])
+        out = self.fc(self.activation(feature_map + data.x))
+        return F.dropout(out, p=self.dropout, training=self.training)
 
     def feature(self, data, adj):
         N = adj.shape[0]
         x = data.x.reshape(-1, N, self.feature_dim)
-        topk_w, topk_idx, _, _ = self._route(x, N)
-        p = self._prompt(topk_w, topk_idx)
-        feature_map = self._backbone_with_prompt(x, adj, p)
-        return feature_map.reshape(-1, self.args.gcn["out_channel"])
-
-    def get_lb_loss(self) -> torch.Tensor:
-        """Switch Transformer load-balancing loss: K * sum(f_i * P_i).
-
-        f_i = fraction of top-k slots assigned to expert i (constant w.r.t. params).
-        P_i = mean softmax probability for expert i (carries the gradient).
-        Minimum is 1.0 when both distributions are uniform; grows when routing
-        concentrates on a few experts.
-        """
-        if self._last_W is None or self._last_topk_idx is None:
-            return torch.zeros((), device=self.cluster_prompts.device)
-        P = self._last_W.mean(dim=0)                                       # [K]
-        onehot = F.one_hot(self._last_topk_idx, num_classes=self.k).float()  # [N, topk, K]
-        f = (onehot.sum(dim=1).mean(dim=0) / self.topk).detach()           # [K], sums to 1
-        return self.k * (f * P).sum()
-
-    def get_z_loss(self) -> torch.Tensor:
-        """ST-MoE router z-loss: penalises large logsumexp of router logits."""
-        if self._last_logits is None:
-            return torch.zeros((), device=self.cluster_prompts.device)
-        return (torch.logsumexp(self._last_logits, dim=-1) ** 2).mean()
-
-    def get_diversity_loss(self) -> torch.Tensor:
-        P = F.normalize(self.cluster_prompts, dim=1)  # [K, hidden_dim]
-        sim = P @ P.T                                 # [K, K]
-        mask = ~torch.eye(self.k, dtype=torch.bool, device=sim.device)
-        return sim[mask].pow(2).mean()
+        x = self._add_prompt(x, adj)
+        feature_map = self.backbone(x, adj).reshape(-1, self.args.gcn["out_channel"])
+        return feature_map + data.x
 
 
 class TrafficStream_Model(nn.Module):

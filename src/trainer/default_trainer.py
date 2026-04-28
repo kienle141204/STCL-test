@@ -78,21 +78,14 @@ def train(inputs, args):
         else:
             model = gnn_model  # Otherwise, use the best model loaded
         
-        if args.method == 'EAC' or args.method == 'Kprompt':
+        if args.method == 'EAC' or args.method == 'KPrompt':
             for name, param in model.named_parameters():
                 if "gcn1" in name or "tcn" in name or "gcn2" in name or "fc" in name or "gcn" in name:
                     param.requires_grad = False
         
         if args.method == 'EAC':
             model.expand_adaptive_params(args.graph_size)
-        
-        if args.method == 'GAPT':
-            n_old = np.load(osp.join(args.graph_path, str(args.year-1)+"_adj.npz"))["x"].shape[0]
-            model.transfer_prompts(n_old, args.graph_size, adj=vars(args).get("adj"))
 
-        if args.method == 'KPrompt':
-            model.update_clusters(args.adj)
-        
         if args.method == 'Universal' and args.use_eac == True:
             for name, param in model.named_parameters():
                 if "gcn1" in name or "tcn1" in name or "gcn2" in name or "fc" in name:
@@ -110,9 +103,6 @@ def train(inputs, args):
         if args.method == 'GAPT':
             model.expand_adaptive_params(args.graph_size)
 
-        if args.method == 'KPrompt':
-            model.update_clusters(args.adj)
-        
         if args.method == 'Universal' and args.use_eac == True:
             model.expand_adaptive_params(args.graph_size)
     
@@ -159,15 +149,6 @@ def train(inputs, args):
             if args.ewc and args.year > args.begin_year:
                 loss += model.compute_consolidation_loss()  # Calculate and add ewc loss if necessary
 
-            if args.method == 'KPrompt':
-                lb_lambda = getattr(args, 'lb_lambda', 0.01)
-                div_lambda = getattr(args, 'div_lambda', 0.005)
-                z_lambda = getattr(args, 'z_lambda', 1e-3)
-                loss = (loss
-                        + lb_lambda * model.get_lb_loss()
-                        + div_lambda * model.get_diversity_loss()
-                        + z_lambda * model.get_z_loss())
-            
             training_loss += float(loss)
             cn += 1
             
