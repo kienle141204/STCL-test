@@ -1446,27 +1446,36 @@ class EAC_Model(nn.Module):
 
 
 # -----------------------------------------------
-# KPrompt V3: Dual ST-conditioned prompt banks
+# KPrompt V4: Latent-space cross-attention prompts + frozen backbone CL
 # -----------------------------------------------
 
 class KPromptModel(nn.Module):
-    """V3 — Dual prompts (input + output banks) routed by an ST query.
+    """V4 — Shared latent space + cross-attention interaction.
 
-    Idea: two banks of K learnable prompts.
-      - Input bank  (K × feature_dim) is added to x_raw *before* the backbone
-        so prompts can shape what the backbone sees when graph/year shifts.
-      - Output bank (K × out_channel) is added to the backbone output as a
-        residual correction in the prediction-feature space.
+    Upgrade over V3: instead of adding input prompts in raw input space (R^T),
+    project x and prompts into a shared latent space (R^d), let them
+    INTERACT via cross-attention there, then decode back to R^T to feed the
+    backbone. Output prompts (residual on backbone output) stay as in V3.
 
-    Both banks share a single ST query per node:
-        query = [ Laplacian-PE(adj) | TimeEncoder(x_window) ]
-    but each bank has its own keys, so routing can specialise per space.
+    Two prompt banks routed by a shared ST query (Laplacian-PE | time enc):
+      - Input bank  (K × latent_dim) interacts with x_lat in shared latent
+        space; the residual mixed prompt is decoded back to R^T and fed
+        into the backbone.
+      - Output bank (K × out_channel) is added to backbone output as a
+        residual correction in prediction-feature space.
 
-    Routing = cosine attention (L2-normalised query · L2-normalised keys),
-    scaled by a learnable temperature `tau` (cosine ∈ [-1,1] is too flat for
-    softmax without scaling), then top-k sparse softmax.
+    Routing for the input bank fuses two signals as additive logits:
+      - ST-routing logits:  tau * cosine(ST-query, in_keys)   (V3 mechanism)
+      - Content logits:     (x_lat * in_prompt^T) / sqrt(d)   (new in V4)
+    Top-k softmax over the sum picks which prompts to mix. The output bank
+    keeps the V3 routing-only path (no content matching).
 
-    Roadmap: V4 will add aux losses (LB entropy + diversity on keys).
+    Continual learning: in default_trainer.py, params with names containing
+    'gcn'/'tcn'/'fc' are frozen from year 2 onward when method == 'KPrompt'.
+    The new V4 modules ('x_encoder', 'x_decoder', 'in_prompts', 'out_prompts',
+    'in_keys', 'out_keys', 'spatio_proj', 'time_encoder', 'tau') intentionally
+    avoid those substrings, so the backbone + fc head are frozen while the
+    latent-interaction stack and prompts adapt to per-year distribution shift.
     """
 
     def __init__(self, args):
@@ -1478,6 +1487,10 @@ class KPromptModel(nn.Module):
 
         self.k    = getattr(args, 'k_prompts', 8)
         self.topk = min(getattr(args, 'prompt_topk', self.k), self.k)
+
+        # Shared latent dim for x <-> input-prompt interaction.
+        # Defaults to feature_dim so existing configs keep working.
+        self.latent_dim = getattr(args, 'latent_dim', 64)
 
         # ST query dims
         self.temporal_dim = getattr(args, 'temporal_dim', 16)
@@ -1497,10 +1510,21 @@ class KPromptModel(nn.Module):
             nn.LayerNorm(self.temporal_dim),
         )
 
-        # Two prompt banks, each with own keys.
-        # Input bank: added to x_raw, lives in feature_dim space.
+        # Latent-space encoder/decoder for x. Names avoid gcn/tcn/fc on
+        # purpose so trainer freeze logic leaves them trainable in year>=2.
+        self.x_encoder = nn.Sequential(
+            nn.Linear(self.feature_dim, self.latent_dim),
+            nn.LayerNorm(self.latent_dim),
+            nn.GELU(),
+        )
+        self.x_decoder = nn.Sequential(
+            nn.Linear(self.latent_dim, self.feature_dim),
+            nn.LayerNorm(self.feature_dim),
+        )
+
+        # Input bank: lives in latent space; interacts with x_lat there.
         self.in_keys    = nn.Parameter(torch.empty(self.k, self.query_dim))
-        self.in_prompts = nn.Parameter(torch.empty(self.k, self.feature_dim))
+        self.in_prompts = nn.Parameter(torch.empty(self.k, self.latent_dim))
         nn.init.normal_(self.in_keys,    std=0.02)
         nn.init.normal_(self.in_prompts, std=0.02)
 
@@ -1510,18 +1534,14 @@ class KPromptModel(nn.Module):
         nn.init.normal_(self.out_keys,    std=0.02)
         nn.init.normal_(self.out_prompts, std=0.02)
 
-        # Learnable temperature for cosine attention.
-        # cosine ∈ [-1,1]; tau≈10 gives logits in [-10,10] before top-k softmax.
+        # Learnable temperature for cosine attention on ST routing.
         self.tau = nn.Parameter(torch.tensor(10.0))
 
-        # Laplacian PE cache, keyed by id(adj). Trainer reuses the same
-        # adj tensor within a year, so id is stable; new year -> new tensor
-        # -> automatic invalidation.
+        # Laplacian PE cache, keyed by id(adj).
         self._lap_pe = None
         self._lap_n  = -1
         self._adj_id = None
 
-        # No aux loss in V3 (added in V4).
         self.aux_loss = None
 
         backbone_type = getattr(args, "backbone_type", "stgnn")
@@ -1576,7 +1596,7 @@ class KPromptModel(nn.Module):
         return lap_pe
 
     # ------------------------------------------------------------------
-    # ST query + cosine routing
+    # ST query + routing primitives
     # ------------------------------------------------------------------
 
     def _build_query(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
@@ -1588,17 +1608,38 @@ class KPromptModel(nn.Module):
         temp   = self.time_encoder(x)                       # [B, N, temporal_dim]
         return torch.cat([spatio, temp], dim=-1)            # [B, N, query_dim]
 
-    def _route(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
-        """query: [B, N, D], keys: [K, D]  ->  weights: [B, N, K]."""
+    def _route_logits(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """Raw cosine logits (pre-softmax) for fusion with content scores."""
         q_norm = F.normalize(query, dim=-1)
         k_norm = F.normalize(keys,  dim=-1)
-        scores = self.tau * torch.einsum('bnd,kd->bnk', q_norm, k_norm)   # [B, N, K]
+        return self.tau * torch.einsum('bnd,kd->bnk', q_norm, k_norm)
+
+    def _topk_softmax(self, logits: torch.Tensor) -> torch.Tensor:
         if self.topk < self.k:
-            topv, topi = scores.topk(self.topk, dim=-1)
-            sparse     = torch.full_like(scores, float('-inf'))
+            topv, topi = logits.topk(self.topk, dim=-1)
+            sparse     = torch.full_like(logits, float('-inf'))
             sparse.scatter_(-1, topi, topv)
             return F.softmax(sparse, dim=-1)
-        return F.softmax(scores, dim=-1)
+        return F.softmax(logits, dim=-1)
+
+    def _route(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """ST-routing-only weights (used for output bank). [B, N, K]."""
+        return self._topk_softmax(self._route_logits(query, keys))
+
+    def _input_interact(self, x: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """Latent-space cross-attention between x and input prompts.
+
+        x: [B, N, T], query: [B, N, query_dim]  ->  x_aug: [B, N, T]
+        """
+        x_lat = self.x_encoder(x)                                   # [B, N, d]
+        # Fused logits = ST-route bias + content match in latent space.
+        scale          = self.latent_dim ** 0.5
+        content_logits = torch.einsum('bnd,kd->bnk', x_lat, self.in_prompts) / scale
+        route_logits   = self._route_logits(query, self.in_keys)
+        w_in           = self._topk_softmax(content_logits + route_logits)
+        p_in_lat       = w_in @ self.in_prompts                     # [B, N, d]
+        x_lat          = x_lat + p_in_lat                           # residual interaction
+        return self.x_decoder(x_lat)                                # [B, N, T]
 
     # ------------------------------------------------------------------
     # forward / feature
@@ -1610,14 +1651,11 @@ class KPromptModel(nn.Module):
 
         query = self._build_query(x, adj)                   # [B, N, query_dim]
 
-        # Input prompt: route -> mix -> add to x_raw before backbone
-        w_in  = self._route(query, self.in_keys)            # [B, N, K]
-        p_in  = w_in @ self.in_prompts                      # [B, N, T]
-        x_aug = x + p_in
+        # Input prompt: latent-space cross-attention -> decode -> backbone
+        x_aug = self._input_interact(x, query)              # [B, N, T]
+        feat  = self.backbone(x_aug, adj)                   # [B, N, out]
 
-        feat = self.backbone(x_aug, adj)                    # [B, N, out]
-
-        # Output prompt: route -> mix -> add residual on backbone output
+        # Output prompt: ST-routed residual on backbone output (V3 path)
         w_out = self._route(query, self.out_keys)           # [B, N, K]
         p_out = w_out @ self.out_prompts                    # [B, N, out]
         feat  = feat + p_out
@@ -1632,10 +1670,7 @@ class KPromptModel(nn.Module):
 
         query = self._build_query(x, adj)
 
-        w_in  = self._route(query, self.in_keys)
-        p_in  = w_in @ self.in_prompts
-        x_aug = x + p_in
-
+        x_aug = self._input_interact(x, query)
         feat  = self.backbone(x_aug, adj)
         w_out = self._route(query, self.out_keys)
         p_out = w_out @ self.out_prompts
