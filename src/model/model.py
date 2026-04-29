@@ -1446,11 +1446,11 @@ class EAC_Model(nn.Module):
 
 
 # -----------------------------------------------
-# KPrompt V3: Dual ST-conditioned prompt banks
+# KPrompt V3.1: Dual ST-conditioned prompt banks
 # -----------------------------------------------
 
 class KPromptModel(nn.Module):
-    """V3 — Dual prompts (input + output banks) routed by an ST query.
+    """V3.1 — Dual prompts (input + output banks) routed by an ST query.
 
     Idea: two banks of K learnable prompts.
       - Input bank  (K × feature_dim) is added to x_raw *before* the backbone
@@ -1463,10 +1463,17 @@ class KPromptModel(nn.Module):
     but each bank has its own keys, so routing can specialise per space.
 
     Routing = cosine attention (L2-normalised query · L2-normalised keys),
-    scaled by a learnable temperature `tau` (cosine ∈ [-1,1] is too flat for
-    softmax without scaling), then top-k sparse softmax.
+    scaled by a per-bank learnable temperature (cosine ∈ [-1,1] is too flat
+    for softmax without scaling), then top-k sparse softmax.
 
-    Roadmap: V4 will add aux losses (LB entropy + diversity on keys).
+    Each bank's residual is gated by tanh(alpha) — initialised at 0 so the
+    model starts as identity pass-through and the gate opens with training.
+
+    Aux loss (training only):
+      - Load-balancing: log K - mean entropy of routing weights, per bank.
+      - Key diversity:  off-diagonal cosine² mean on keys, per bank.
+    Trainer in src/trainer/default_trainer.py adds `model.aux_loss` to the
+    main MSE/MAE loss when present.
     """
 
     def __init__(self, args):
@@ -1484,6 +1491,10 @@ class KPromptModel(nn.Module):
         self.spatial_dim  = getattr(args, 'spatial_dim',  self.temporal_dim)
         self.lap_k        = getattr(args, 'lap_k',        self.spatial_dim)
         self.query_dim    = self.spatial_dim + self.temporal_dim
+
+        # Aux loss weights (V3.1). Tunable via config.
+        self.lambda_lb  = getattr(args, 'kp_lambda_lb',  0.01)
+        self.lambda_div = getattr(args, 'kp_lambda_div', 0.01)
 
         # Spatial branch: Laplacian PE -> spatial_dim
         self.spatio_proj = nn.Sequential(
@@ -1510,9 +1521,19 @@ class KPromptModel(nn.Module):
         nn.init.normal_(self.out_keys,    std=0.02)
         nn.init.normal_(self.out_prompts, std=0.02)
 
-        # Learnable temperature for cosine attention.
+        # Per-bank learnable temperatures for cosine attention.
         # cosine ∈ [-1,1]; tau≈10 gives logits in [-10,10] before top-k softmax.
-        self.tau = nn.Parameter(torch.tensor(10.0))
+        # Two banks live in different spaces (input vs output features) and
+        # generally need different sharpness, so we keep them independent.
+        self.tau_in  = nn.Parameter(torch.tensor(10.0))
+        self.tau_out = nn.Parameter(torch.tensor(10.0))
+
+        # Per-bank residual gates. Initialised at 0 so tanh(α)=0 ⇒ the model
+        # starts as identity-pass-through; gradients open the gate as needed.
+        # Critical when the backbone is frozen and we load a previous-year
+        # checkpoint: prompts cannot disrupt prior predictions on step 1.
+        self.alpha_in  = nn.Parameter(torch.zeros(1))
+        self.alpha_out = nn.Parameter(torch.zeros(1))
 
         # Laplacian PE cache, keyed by id(adj). Trainer reuses the same
         # adj tensor within a year, so id is stable; new year -> new tensor
@@ -1521,7 +1542,7 @@ class KPromptModel(nn.Module):
         self._lap_n  = -1
         self._adj_id = None
 
-        # No aux loss in V3 (added in V4).
+        # Set per forward(); read by trainer when self.training.
         self.aux_loss = None
 
         backbone_type = getattr(args, "backbone_type", "stgnn")
@@ -1551,11 +1572,18 @@ class KPromptModel(nn.Module):
             return self._lap_pe
 
         with torch.no_grad():
-            deg        = adj.sum(dim=-1).clamp(min=1e-8)
+            # eigh requires symmetric input. PEMS adjacency is directed, so
+            # symmetrise before computing the normalised Laplacian — otherwise
+            # the eigendecomposition is ill-defined and PE depends on the
+            # arbitrary orientation chosen at graph-build time.
+            A          = 0.5 * (adj + adj.transpose(-1, -2))
+            deg        = A.sum(dim=-1).clamp(min=1e-8)
             d_inv_sqrt = deg.pow(-0.5)
             # L = I - D^{-1/2} A D^{-1/2}
-            L = torch.eye(N, device=adj.device, dtype=adj.dtype) - \
-                d_inv_sqrt.unsqueeze(1) * adj * d_inv_sqrt.unsqueeze(0)
+            L = torch.eye(N, device=A.device, dtype=A.dtype) - \
+                d_inv_sqrt.unsqueeze(1) * A * d_inv_sqrt.unsqueeze(0)
+            # Numerical symmetry guard for eigh.
+            L = 0.5 * (L + L.transpose(-1, -2))
 
             _, eigvecs = torch.linalg.eigh(L)               # ascending
             k      = min(self.lap_k, N - 1)
@@ -1588,17 +1616,48 @@ class KPromptModel(nn.Module):
         temp   = self.time_encoder(x)                       # [B, N, temporal_dim]
         return torch.cat([spatio, temp], dim=-1)            # [B, N, query_dim]
 
-    def _route(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    def _route(self, query: torch.Tensor, keys: torch.Tensor,
+               tau: torch.Tensor) -> torch.Tensor:
         """query: [B, N, D], keys: [K, D]  ->  weights: [B, N, K]."""
+        # Clamp tau to keep softmax in a numerically sane regime even if the
+        # optimiser pushes it hard.
+        tau = tau.clamp(1.0, 50.0)
         q_norm = F.normalize(query, dim=-1)
         k_norm = F.normalize(keys,  dim=-1)
-        scores = self.tau * torch.einsum('bnd,kd->bnk', q_norm, k_norm)   # [B, N, K]
+        scores = tau * torch.einsum('bnd,kd->bnk', q_norm, k_norm)   # [B, N, K]
         if self.topk < self.k:
             topv, topi = scores.topk(self.topk, dim=-1)
             sparse     = torch.full_like(scores, float('-inf'))
             sparse.scatter_(-1, topi, topv)
             return F.softmax(sparse, dim=-1)
         return F.softmax(scores, dim=-1)
+
+    # ------------------------------------------------------------------
+    # aux loss (load-balancing + key diversity)
+    # ------------------------------------------------------------------
+
+    def _key_diversity(self, keys: torch.Tensor) -> torch.Tensor:
+        """Off-diagonal cosine² mean — pushes keys toward orthogonality."""
+        k_norm = F.normalize(keys, dim=-1)
+        sim    = k_norm @ k_norm.t()                                 # [K, K]
+        eye    = torch.eye(self.k, device=keys.device, dtype=keys.dtype)
+        return (sim - eye).pow(2).mean()
+
+    def _compute_aux_loss(self, w_in: torch.Tensor,
+                          w_out: torch.Tensor) -> torch.Tensor:
+        # Load-balancing: maximise entropy of mean routing -> equal usage.
+        # Loss = log K - mean_entropy, so 0 at uniform usage.
+        log_k    = math.log(self.k)
+        p_in     = w_in.mean(dim=(0, 1))                             # [K]
+        p_out    = w_out.mean(dim=(0, 1))
+        ent_in   = -(p_in  * (p_in  + 1e-9).log()).sum()
+        ent_out  = -(p_out * (p_out + 1e-9).log()).sum()
+        lb_loss  = (log_k - ent_in) + (log_k - ent_out)
+
+        div_loss = self._key_diversity(self.in_keys) + \
+                   self._key_diversity(self.out_keys)
+
+        return self.lambda_lb * lb_loss + self.lambda_div * div_loss
 
     # ------------------------------------------------------------------
     # forward / feature
@@ -1610,17 +1669,25 @@ class KPromptModel(nn.Module):
 
         query = self._build_query(x, adj)                   # [B, N, query_dim]
 
-        # Input prompt: route -> mix -> add to x_raw before backbone
-        w_in  = self._route(query, self.in_keys)            # [B, N, K]
-        p_in  = w_in @ self.in_prompts                      # [B, N, T]
-        x_aug = x + p_in
+        # Input prompt: route -> mix -> gated add to x_raw before backbone
+        w_in  = self._route(query, self.in_keys,  self.tau_in)   # [B, N, K]
+        p_in  = w_in @ self.in_prompts                           # [B, N, T]
+        g_in  = torch.tanh(self.alpha_in)
+        x_aug = x + g_in * p_in
 
         feat = self.backbone(x_aug, adj)                    # [B, N, out]
 
-        # Output prompt: route -> mix -> add residual on backbone output
-        w_out = self._route(query, self.out_keys)           # [B, N, K]
-        p_out = w_out @ self.out_prompts                    # [B, N, out]
-        feat  = feat + p_out
+        # Output prompt: route -> mix -> gated residual on backbone output
+        w_out = self._route(query, self.out_keys, self.tau_out)  # [B, N, K]
+        p_out = w_out @ self.out_prompts                         # [B, N, out]
+        g_out = torch.tanh(self.alpha_out)
+        feat  = feat + g_out * p_out
+
+        # Aux loss: only build the graph during training so eval is free.
+        if self.training:
+            self.aux_loss = self._compute_aux_loss(w_in, w_out)
+        else:
+            self.aux_loss = None
 
         feat = feat.reshape(-1, self.out_channel)           # [B*N, out]
         out  = self.fc(self.activation(feat + data.x))
@@ -1632,14 +1699,14 @@ class KPromptModel(nn.Module):
 
         query = self._build_query(x, adj)
 
-        w_in  = self._route(query, self.in_keys)
+        w_in  = self._route(query, self.in_keys,  self.tau_in)
         p_in  = w_in @ self.in_prompts
-        x_aug = x + p_in
+        x_aug = x + torch.tanh(self.alpha_in) * p_in
 
         feat  = self.backbone(x_aug, adj)
-        w_out = self._route(query, self.out_keys)
+        w_out = self._route(query, self.out_keys, self.tau_out)
         p_out = w_out @ self.out_prompts
-        feat  = (feat + p_out).reshape(-1, self.out_channel)
+        feat  = (feat + torch.tanh(self.alpha_out) * p_out).reshape(-1, self.out_channel)
         return feat + data.x
 
 
