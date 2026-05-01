@@ -1710,6 +1710,188 @@ class KPromptModel(nn.Module):
         return feat + data.x
 
 
+# -----------------------------------------------
+# LSPCL: Latent-Space Prompt for Continual Learning
+# -----------------------------------------------
+
+class LSPCL_Model(nn.Module):
+    """Latent-Space Prompt for Continual Learning.
+
+    Encoder Phi: R^T -> R^d (d=64) projects each node's input window into a
+    learned latent space. A *fixed-size* pool of M (key, prompt) pairs lives
+    in that same latent space — M is per dataset, not per node and not
+    per year. Each node's prompt is a top-k cosine-routed mixture over the
+    M pool entries. The mixed prompt is added (tanh-gated) to z, decoded
+    back to T, then fed to the standard STGNN backbone.
+
+    Continual learning protocol (full-shot):
+      year 0  : train Phi, Psi, pool, backbone, fc + AE warm-up.
+      year t>0: trainer freezes backbone+fc by name match and calls
+                 model.on_new_year(). That hook
+                   - freezes Phi and Psi (latent space fixed for transfer),
+                   - snapshots prompts into anchor_prompts and turns the L2
+                     anchor on (so prompts can adapt but stay close to
+                     year-(t-1) values, supporting later zero/few-shot).
+                 Trainable in year t>0: keys, prompts, tau, alpha.
+    """
+
+    def __init__(self, args):
+        super(LSPCL_Model, self).__init__()
+        self.args        = args
+        self.dropout     = args.dropout
+        self.feature_dim = args.gcn["in_channel"]
+        self.out_channel = args.gcn["out_channel"]
+
+        self.d              = getattr(args, 'lsp_d',             64)
+        self.M              = getattr(args, 'lsp_m',             16)   # fixed pool size, per dataset
+        self.topk           = getattr(args, 'lsp_topk',          2)
+        self.lambda_ae      = getattr(args, 'lsp_lambda_ae',     0.1)
+        self.lambda_lb      = getattr(args, 'lsp_lambda_lb',     0.01)
+        self.lambda_div     = getattr(args, 'lsp_lambda_div',    0.01)
+        self.lambda_anchor  = getattr(args, 'lsp_lambda_anchor', 0.1)
+
+        self.encoder = nn.Sequential(
+            nn.Linear(self.feature_dim, self.d),
+            nn.GELU(),
+            nn.LayerNorm(self.d),
+            nn.Linear(self.d, self.d),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(self.d, self.d),
+            nn.GELU(),
+            nn.LayerNorm(self.d),
+            nn.Linear(self.d, self.feature_dim),
+        )
+
+        # Fixed pool: M keys + M prompts, both in R^d.
+        self.keys    = nn.Parameter(torch.empty(self.M, self.d).normal_(0, 0.02))
+        self.prompts = nn.Parameter(torch.empty(self.M, self.d).normal_(0, 0.02))
+
+        # Anchor of the prompt matrix at the start of the current year's
+        # training. Persisted via state_dict; populated by on_new_year().
+        self.register_buffer('anchor_prompts', torch.zeros(self.M, self.d))
+        self.register_buffer('anchor_active',  torch.zeros(1))
+
+        self.tau   = nn.Parameter(torch.tensor(10.0))
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+        backbone_type = getattr(args, "backbone_type", "stgnn")
+        if backbone_type == "dcrnn":
+            self.backbone = DCRNN_Backbone(args)
+        elif backbone_type == "astgnn":
+            self.backbone = ASTGNN_Backbone(args)
+        elif backbone_type == "tgcn":
+            self.backbone = TGCN_Backbone(args)
+        else:
+            self.backbone = STGNN_Backbone(args)
+
+        self.fc         = nn.Linear(self.out_channel, args.y_len)
+        self.activation = nn.GELU()
+
+        self.year     = getattr(args, 'year', None)
+        self.aux_loss = None
+
+        self.logger = getattr(args, 'logger', None)
+        if self.logger:
+            self.logger.info(
+                f"LSPCL initialised: d={self.d}, M={self.M}, topk={self.topk}, "
+                f"backbone={backbone_type}"
+            )
+
+    # ------------------------------------------------------------------
+    def on_new_year(self):
+        """Called by the trainer at the start of years > begin_year.
+        Freezes Phi/Psi and snapshots the prompt matrix for the L2 anchor."""
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        for p in self.decoder.parameters():
+            p.requires_grad = False
+        with torch.no_grad():
+            self.anchor_prompts.copy_(self.prompts.data)
+            self.anchor_active.fill_(1.0)
+        self.year = getattr(self.args, 'year', self.year)
+
+    # ------------------------------------------------------------------
+    def _route(self, query):
+        """query: [B, N, d]  ->  weights: [B, N, M] (top-k sparse softmax)."""
+        tau    = self.tau.clamp(1.0, 50.0)
+        q_norm = F.normalize(query,    dim=-1)
+        k_norm = F.normalize(self.keys, dim=-1)
+        scores = tau * torch.einsum('bnd,kd->bnk', q_norm, k_norm)
+        topk   = min(self.topk, self.M)
+        if topk < self.M:
+            topv, topi = scores.topk(topk, dim=-1)
+            sparse     = torch.full_like(scores, float('-inf'))
+            sparse.scatter_(-1, topi, topv)
+            return F.softmax(sparse, dim=-1)
+        return F.softmax(scores, dim=-1)
+
+    def _aux(self, w, x, x_recon):
+        log_k = math.log(self.M) if self.M > 1 else 0.0
+        p_use = w.mean(dim=(0, 1))
+        ent   = -(p_use * (p_use + 1e-9).log()).sum()
+        lb    = log_k - ent
+
+        k_norm = F.normalize(self.keys, dim=-1)
+        sim    = k_norm @ k_norm.t()
+        eye    = torch.eye(self.M, device=self.keys.device, dtype=self.keys.dtype)
+        div    = (sim - eye).pow(2).mean()
+
+        ae = F.mse_loss(x_recon, x)
+
+        if float(self.anchor_active.item()) > 0.5:
+            anchor = F.mse_loss(self.prompts, self.anchor_prompts)
+        else:
+            anchor = self.prompts.new_tensor(0.0)
+
+        return (self.lambda_lb     * lb
+                + self.lambda_div    * div
+                + self.lambda_ae     * ae
+                + self.lambda_anchor * anchor)
+
+    # ------------------------------------------------------------------
+    def forward(self, data, adj):
+        N = adj.shape[0]
+        x = data.x.reshape(-1, N, self.feature_dim)         # [B, N, T]
+
+        z     = self.encoder(x)                             # [B, N, d]
+        w     = self._route(z)                              # [B, N, M]
+        p_mix = w @ self.prompts                            # [B, N, d]
+        z_aug = z + torch.tanh(self.alpha) * p_mix
+
+        x_aug = self.decoder(z_aug)                         # [B, N, T]
+        feat  = self.backbone(x_aug, adj)                   # [B, N, out]
+
+        feat = feat.reshape(-1, self.out_channel)
+        out  = self.fc(self.activation(feat + data.x))
+        out  = F.dropout(out, p=self.dropout, training=self.training)
+
+        if self.training:
+            x_recon       = self.decoder(z)                 # AE warm-up signal
+            self.aux_loss = self._aux(w, x, x_recon)
+        else:
+            self.aux_loss = None
+
+        return out
+
+    def feature(self, data, adj):
+        N = adj.shape[0]
+        x = data.x.reshape(-1, N, self.feature_dim)
+        z = self.encoder(x)
+        w = self._route(z)
+        z_aug = z + torch.tanh(self.alpha) * (w @ self.prompts)
+        x_aug = self.decoder(z_aug)
+        feat  = self.backbone(x_aug, adj).reshape(-1, self.out_channel)
+        return feat + data.x
+
+    def count_parameters(self):
+        total = sum(p.numel() for p in self.parameters())
+        train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        log = self.args.logger.info if hasattr(self.args, 'logger') else print
+        log(f"LSPCL Total Parameters: {total}")
+        log(f"LSPCL Trainable Parameters: {train}")
+
+
 class TrafficStream_Model(nn.Module):
     def __init__(self, args):
         super(TrafficStream_Model, self).__init__()

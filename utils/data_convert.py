@@ -71,9 +71,15 @@ def generate_samples(days, savepath, data, graph, train_rate=0.6, val_rate=0.2, 
     It would be more reasonable to use only the mean and standard deviation of the training data to normalize the validation and test sets.
     However, for consistency reasons, we follow TrafficStream's approach, which is currently acceptable.
     """
-    train_x = z_score(train_x)
-    val_x = z_score(val_x)
-    test_x = z_score(test_x)
+    mean_train = np.mean(train_x)  
+    std_train = np.std(train_x)  
+
+    train_x = (train_x - mean_train) / std_train
+    val_x = (val_x - mean_train) / std_train
+    test_x = (test_x - mean_train) / std_train
+    # train_x = z_score(train_x)
+    # val_x = z_score(val_x)
+    # test_x = z_score(test_x)
     
     # Save data to file
     np.savez(savepath, train_x=train_x, train_y=train_y, val_x=val_x, val_y=val_y, test_x=test_x, test_y=test_y, edge_index=edge_index)

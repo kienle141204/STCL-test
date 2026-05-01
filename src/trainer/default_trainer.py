@@ -78,13 +78,16 @@ def train(inputs, args):
         else:
             model = gnn_model  # Otherwise, use the best model loaded
         
-        if args.method == 'EAC' or args.method == 'KPrompt':
+        if args.method == 'EAC' or args.method == 'KPrompt' or args.method == 'LSPCL':
             for name, param in model.named_parameters():
                 if "gcn1" in name or "tcn" in name or "gcn2" in name or "fc" in name or "gcn" in name:
                     param.requires_grad = False
-        
+
         if args.method == 'EAC':
             model.expand_adaptive_params(args.graph_size)
+
+        if args.method == 'LSPCL':
+            model.on_new_year()
 
         if args.method == 'Universal' and args.use_eac == True:
             for name, param in model.named_parameters():
@@ -146,7 +149,7 @@ def train(inputs, args):
             
             loss = lossfunc(data.y, pred, reduction="mean")
 
-            if args.method == 'KPrompt' and getattr(model, 'aux_loss', None) is not None:
+            if args.method in ('KPrompt', 'LSPCL') and getattr(model, 'aux_loss', None) is not None:
                 loss = loss + model.aux_loss
 
             if args.ewc and args.year > args.begin_year:

@@ -39,7 +39,7 @@ def load_best_model(args):
         else:
             for idx, _ in enumerate(range(args.year - args.begin_year)):
                 model.expand_adaptive_params(args.graph_size_list[idx])
-    
+
     if args.method == 'Universal' and args.use_eac == True:
         if args.year == args.begin_year:
             model.expand_adaptive_params(args.base_node_size)
@@ -81,10 +81,11 @@ def save_results_csv(args, total_time, csv_path="results.csv"):
 
     dataset = osp.basename(args.model_path.rstrip("/\\"))
 
-    if csv_path == "results_kprompt.csv":
-        csv_path = f"results_kprompt_{dataset}_{args.incremental_train_ratio}.csv"
-    elif csv_path == "results.csv":
+    if csv_path == "results.csv":
         csv_path = f"results_{args.incremental_train_ratio}.csv"
+    else:
+        csv_path = f"results_kprompt_{dataset}_{args.incremental_train_ratio}.csv"
+
 
     row = {
         "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
