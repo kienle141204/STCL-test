@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(Get-ChildItem -Path \"E:\\\\STRAP\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(conda run -n stg python -c ' *)",
+      "Skill(cl-problem)"
     ]
   }
 }

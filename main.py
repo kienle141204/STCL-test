@@ -9,7 +9,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import k_hop_subgraph
 
 from utils.data_convert import generate_samples
-from src.model.model import TrafficStream_Model, STKEC_Model, EAC_Model,RAP_Model,STLora_Model,TGCN_Model,DCRNN_Model,ASTGNN_Model,STGNN_Model,STAdapter_Model,GraphPro_Model,PECPM_Model,KPromptModel,LSPCL_Model
+from src.model.model import TrafficStream_Model, STKEC_Model, EAC_Model,RAP_Model,STLora_Model,TGCN_Model,DCRNN_Model,ASTGNN_Model,STGNN_Model,STAdapter_Model,GraphPro_Model,PECPM_Model,KPromptModel,LSPCL_Model,GDAPModel
 from dataer.SpatioTemporalDataset import SpatioTemporalDataset
 from model import detect_default
 from src.model import replay
@@ -52,6 +52,20 @@ def main(args):
         adj = np.load(osp.join(args.graph_path, str(args.year)+"_adj.npz"))["x"]
         adj = adj / (np.sum(adj, 1, keepdims=True) + 1e-6)
         vars(args)["adj"] = torch.from_numpy(adj).to(torch.float).to(args.device)  # Convert the adjacency matrix to a PyTorch tensor and store it in args
+
+        # Track ΔA = A_t − A_{t-1} for SCAA (also available to other methods via args)
+        if year == args.begin_year:
+            vars(args)["prev_adj"]       = args.adj
+            vars(args)["delta_adj"]      = torch.zeros_like(args.adj)
+            vars(args)["new_node_start"] = None
+        else:
+            N_cur  = args.adj.shape[0]
+            N_prev = args.prev_adj.shape[0]
+            delta  = torch.zeros(N_cur, N_cur, device=args.device)
+            delta[:N_prev, :N_prev] = args.adj[:N_prev, :N_prev] - args.prev_adj
+            vars(args)["delta_adj"]      = delta
+            vars(args)["new_node_start"] = N_prev if N_cur > N_prev else None
+            vars(args)["prev_adj"]       = args.adj
         
         if year == args.begin_year and args.load_first_year:  # If it is the first year and you need to skip the first year, the model has been trained and does not need to be retrained
             model, _ = load_best_model(args)
@@ -191,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument("--first_year_model_path", type = str, default = "", help='specify a pretrained model root')
     args = parser.parse_args()
     vars(args)["device"] = torch.device("cuda:{}".format(args.gpuid)) if torch.cuda.is_available() and args.gpuid != -1 else "cpu"
-    vars(args)["methods"] = {'PECPM':PECPM_Model,'ST-Adapter':STAdapter_Model,'GraphPro':GraphPro_Model,'STGNN_Model':STGNN_Model,'ASTGNN_Model':ASTGNN_Model,'DCRNN_Model':DCRNN_Model,'TGCN_Model':TGCN_Model,'STLoRA':STLora_Model,'RAP':RAP_Model,'TrafficStream': TrafficStream_Model, 'STKEC': STKEC_Model, 'EAC': EAC_Model, 'KPrompt': KPromptModel, 'LSPCL': LSPCL_Model}
+    vars(args)["methods"] = {'PECPM':PECPM_Model,'ST-Adapter':STAdapter_Model,'GraphPro':GraphPro_Model,'STGNN_Model':STGNN_Model,'ASTGNN_Model':ASTGNN_Model,'DCRNN_Model':DCRNN_Model,'TGCN_Model':TGCN_Model,'STLoRA':STLora_Model,'RAP':RAP_Model,'TrafficStream': TrafficStream_Model, 'STKEC': STKEC_Model, 'EAC': EAC_Model, 'KPrompt': KPromptModel, 'LSPCL': LSPCL_Model, 'GDAP': GDAPModel}
     
     init(args)
     seed_anything(args.seed)

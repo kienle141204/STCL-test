@@ -1949,6 +1949,59 @@ class TrafficStream_Model(nn.Module):
         return x
 
 
+class GDAPModel(nn.Module):
+    """
+    Graph-Diffused Adaptive Plasticity.
+
+    Structurally identical to TrafficStream_Model; GDAP logic lives in the
+    trainer (compute_plasticity_weights, gdap_ewc_loss). Three plain Python
+    attributes carry per-phase state — kept out of state_dict intentionally so
+    checkpoint save/load is transparent.
+    """
+
+    def __init__(self, args):
+        super(GDAPModel, self).__init__()
+        self.args    = args
+        self.dropout = getattr(args, "dropout", 0.0)
+
+        backbone_type = getattr(args, "backbone_type", "stgnn")
+        if backbone_type == "dcrnn":
+            self.backbone = DCRNN_Backbone(args)
+        elif backbone_type == "astgnn":
+            self.backbone = ASTGNN_Backbone(args)
+        elif backbone_type == "tgcn":
+            self.backbone = TGCN_Backbone(args)
+        else:
+            self.backbone = STGNN_Backbone(args)
+
+        self.fc         = nn.Linear(args.gcn["out_channel"], args.y_len)
+        self.activation = nn.GELU()
+
+        # Per-phase GDAP state — plain attrs, NOT in state_dict, recomputed each phase
+        self.plasticity_weights = None  # Tensor [N]
+        self.fisher_diag_dict   = {}    # {param_name: Tensor}
+        self.prev_params        = {}    # {param_name: Tensor}
+
+    def forward(self, data, adj):
+        N           = adj.shape[0]
+        x           = data.x.reshape(-1, N, self.args.gcn["in_channel"])
+        feature_map = self.backbone(x, adj).reshape(-1, self.args.gcn["out_channel"])
+        x           = self.fc(self.activation(feature_map + data.x))
+        return F.dropout(x, p=self.dropout, training=self.training)
+
+    def feature(self, data, adj):
+        N           = adj.shape[0]
+        x           = data.x.reshape(-1, N, self.args.gcn["in_channel"])
+        feature_map = self.backbone(x, adj).reshape(-1, self.args.gcn["out_channel"])
+        return feature_map + data.x
+
+    def count_parameters(self):
+        total     = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        log = self.args.logger.info if hasattr(self.args, "logger") else print
+        log(f"GDAPModel total params: {total}, trainable: {trainable}")
+
+
 class STKEC_Model(nn.Module):
 
     def __init__(self, args):
